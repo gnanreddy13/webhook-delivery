@@ -15,6 +15,7 @@ import (
 	"github.com/gnanreddy13/webhook-delivery/internal/config"
 	"github.com/gnanreddy13/webhook-delivery/internal/db"
 	"github.com/gnanreddy13/webhook-delivery/internal/store"
+	"github.com/gnanreddy13/webhook-delivery/internal/worker"
 )
 
 func main() {
@@ -49,22 +50,46 @@ func run() error {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
+	workers := worker.New(worker.Config{
+		Workers:      cfg.WorkerCount,
+		BatchSize:    cfg.ClaimBatchSize,
+		MaxAttempts:  cfg.MaxAttempts,
+		BackoffBase:  cfg.BackoffBase,
+		BackoffMax:   cfg.BackoffMax,
+		Timeout:      cfg.DeliveryTimeout,
+		Lease:        cfg.LeaseDuration,
+		PollInterval: cfg.PollInterval,
+	}, st)
+	workersDone := make(chan struct{})
+	go func() {
+		workers.Run(ctx)
+		close(workersDone)
+	}()
+
 	errc := make(chan error, 1)
 	go func() {
-		slog.Info("listening", "addr", cfg.ListenAddr)
+		slog.Info("listening", "addr", cfg.ListenAddr, "workers", cfg.WorkerCount)
 		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 			errc <- err
 		}
 	}()
 
+	var runErr error
 	select {
-	case err := <-errc:
-		return err
+	case runErr = <-errc:
+		stop() // also stop the workers
 	case <-ctx.Done():
 	}
 
+	// Stop accepting requests, then wait for workers to finish their
+	// in-flight attempt (bounded by DELIVERY_TIMEOUT).
 	slog.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return srv.Shutdown(shutdownCtx)
+	if err := srv.Shutdown(shutdownCtx); err != nil && runErr == nil {
+		runErr = err
+	}
+	<-workersDone
+	slog.Info("stopped")
+	return runErr
 }

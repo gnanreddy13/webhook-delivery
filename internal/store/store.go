@@ -133,3 +133,100 @@ func (s *Store) ListDeliveries(ctx context.Context, status string, limit int) ([
 	}
 	return out, rows.Err()
 }
+
+// Job is a claimed delivery plus everything needed to send it.
+type Job struct {
+	DeliveryID     int64
+	Attempts       int
+	LeaseUntil     time.Time // next_attempt_at written by the claim; acts as a lease token
+	EventID        string
+	EventType      string
+	Payload        json.RawMessage
+	EventCreatedAt time.Time
+	URL            string
+	Secret         string
+}
+
+// ClaimDue locks up to limit due pending deliveries with FOR UPDATE SKIP
+// LOCKED and leases them by pushing next_attempt_at forward by lease. If the
+// worker dies before recording a result, the rows simply become due again
+// when the lease expires.
+func (s *Store) ClaimDue(ctx context.Context, limit int, lease time.Duration) ([]Job, error) {
+	rows, err := s.pool.Query(ctx,
+		`WITH due AS (
+			SELECT id FROM deliveries
+			WHERE status = 'pending' AND next_attempt_at <= now()
+			ORDER BY next_attempt_at
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE deliveries d
+		SET next_attempt_at = now() + $2 * interval '1 millisecond', updated_at = now()
+		FROM due, events e, endpoints ep
+		WHERE d.id = due.id AND e.id = d.event_id AND ep.id = d.endpoint_id
+		RETURNING d.id, d.attempts, d.next_attempt_at, e.id, e.type, e.payload, e.created_at, ep.url, ep.secret`,
+		limit, lease.Milliseconds())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []Job
+	for rows.Next() {
+		var j Job
+		if err := rows.Scan(&j.DeliveryID, &j.Attempts, &j.LeaseUntil, &j.EventID, &j.EventType,
+			&j.Payload, &j.EventCreatedAt, &j.URL, &j.Secret); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, j)
+	}
+	return jobs, rows.Err()
+}
+
+// ErrLeaseLost means the lease expired and another worker may own the row.
+var ErrLeaseLost = errors.New("lease lost")
+
+// MarkDelivered records a successful attempt.
+func (s *Store) MarkDelivered(ctx context.Context, j Job, statusCode int) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE deliveries
+		 SET status = 'delivered', attempts = attempts + 1, last_status_code = $2,
+		     last_error = NULL, delivered_at = now(), updated_at = now()
+		 WHERE id = $1 AND status = 'pending' AND next_attempt_at = $3`,
+		j.DeliveryID, statusCode, j.LeaseUntil)
+	if err == nil && tag.RowsAffected() == 0 {
+		return ErrLeaseLost
+	}
+	return err
+}
+
+// MarkFailed records a failed attempt. If dead is true the delivery is
+// given up on; otherwise it is retried at nextAttempt.
+func (s *Store) MarkFailed(ctx context.Context, j Job, statusCode *int, errMsg string, dead bool, nextAttempt time.Time) error {
+	status := "pending"
+	if dead {
+		status = "dead"
+	}
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE deliveries
+		 SET status = $2, attempts = attempts + 1, last_status_code = $3, last_error = $4,
+		     next_attempt_at = $5, updated_at = now()
+		 WHERE id = $1 AND status = 'pending' AND next_attempt_at = $6`,
+		j.DeliveryID, status, statusCode, errMsg, nextAttempt, j.LeaseUntil)
+	if err == nil && tag.RowsAffected() == 0 {
+		return ErrLeaseLost
+	}
+	return err
+}
+
+// Release makes claimed-but-unsent jobs due immediately (used on shutdown).
+func (s *Store) Release(ctx context.Context, jobs []Job) error {
+	ids := make([]int64, len(jobs))
+	for i, j := range jobs {
+		ids[i] = j.DeliveryID
+	}
+	_, err := s.pool.Exec(ctx,
+		`UPDATE deliveries SET next_attempt_at = now(), updated_at = now()
+		 WHERE id = ANY ($1) AND status = 'pending'`, ids)
+	return err
+}
