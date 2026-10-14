@@ -190,6 +190,9 @@ func TestFailingReceiverEndsDead(t *testing.T) {
 		t.Fatalf("want 1 dead delivery, got %d", len(ds))
 	}
 	d := ds[0].(map[string]any)
+	if d["next_attempt_at"] != nil {
+		t.Errorf("dead delivery should have null next_attempt_at, got %v", d["next_attempt_at"])
+	}
 	if d["attempts"].(float64) != maxAttempts || d["last_status_code"].(float64) != 503 || d["last_error"] != "HTTP 503" {
 		t.Errorf("unexpected dead delivery: %v", d)
 	}
@@ -280,6 +283,13 @@ func TestDuplicateEventsAreIgnored(t *testing.T) {
 	}
 	if n := countWhere(t, pool, "event_id = 'evt_dup'"); n != 2 {
 		t.Fatalf("want 2 delivery rows (one per endpoint), got %d", n)
+	}
+
+	_, pending := apiCall(t, srv, "GET", "/deliveries?status=pending", "")
+	for _, d := range pending["deliveries"].([]any) {
+		if d.(map[string]any)["next_attempt_at"] == nil {
+			t.Errorf("pending delivery should have next_attempt_at set")
+		}
 	}
 
 	startWorkers(t, st, 8, 3)

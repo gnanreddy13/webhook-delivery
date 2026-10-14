@@ -41,7 +41,7 @@ type Delivery struct {
 	EndpointID     string     `json:"endpoint_id"`
 	Status         string     `json:"status"`
 	Attempts       int        `json:"attempts"`
-	NextAttemptAt  time.Time  `json:"next_attempt_at"`
+	NextAttemptAt  *time.Time `json:"next_attempt_at"` // null unless pending
 	LastStatusCode *int       `json:"last_status_code"`
 	LastError      *string    `json:"last_error"`
 	CreatedAt      time.Time  `json:"created_at"`
@@ -97,8 +97,14 @@ const deliveryColumns = `id, event_id, endpoint_id, status, attempts, next_attem
 
 func scanDelivery(row pgx.Row) (Delivery, error) {
 	var d Delivery
-	err := row.Scan(&d.ID, &d.EventID, &d.EndpointID, &d.Status, &d.Attempts, &d.NextAttemptAt,
+	var next time.Time
+	err := row.Scan(&d.ID, &d.EventID, &d.EndpointID, &d.Status, &d.Attempts, &next,
 		&d.LastStatusCode, &d.LastError, &d.CreatedAt, &d.UpdatedAt, &d.DeliveredAt)
+	// For delivered and dead rows the column only holds a stale lease or
+	// retry time, so don't expose it.
+	if d.Status == "pending" {
+		d.NextAttemptAt = &next
+	}
 	return d, err
 }
 

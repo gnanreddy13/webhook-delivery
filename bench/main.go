@@ -29,6 +29,7 @@ func main() {
 	concurrency := flag.Int("concurrency", 32, "concurrent POST /events clients")
 	timeout := flag.Duration("timeout", 10*time.Minute, "max time to wait for deliveries to finish")
 	label := flag.String("label", "", "label printed with the results")
+	allowRemote := flag.Bool("allow-remote-db", false, "allow a non-localhost database (its tables will be wiped)")
 	flag.Parse()
 	apiKey := os.Getenv("API_KEY")
 	if apiKey == "" || *dbURL == "" {
@@ -36,7 +37,16 @@ func main() {
 	}
 
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, *dbURL)
+	poolCfg, err := pgxpool.ParseConfig(*dbURL)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// The bench wipes tables, so refuse anything but a local database unless
+	// explicitly allowed.
+	if h := poolCfg.ConnConfig.Host; !*allowRemote && h != "localhost" && h != "127.0.0.1" && h != "::1" && !strings.HasPrefix(h, "/") {
+		log.Fatalf("refusing to wipe tables on non-local database host %q (use -allow-remote-db)", h)
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -62,7 +62,7 @@ curl -s -H "Authorization: Bearer $API_KEY" localhost:8080/deliveries/1
 | `POST /endpoints` | `url` must be absolute http(s). `event_types` must be non-empty. Returns a fresh `whsec_…` secret. |
 | `POST /events` | `id`, `type` and `payload` (any non-null JSON) are required. Bodies are limited to 1 MiB. |
 | `GET /deliveries` | Optional `status` (`pending`, `delivered` or `dead`) and `limit` (1–1000, default 100). Newest first. |
-| `GET /deliveries/{id}` | Returns `status`, `attempts`, `next_attempt_at`, `last_status_code`, `last_error` and timestamps. |
+| `GET /deliveries/{id}` | Returns `status`, `attempts`, `next_attempt_at` (null once delivered or dead), `last_status_code`, `last_error` and timestamps. |
 
 ### What a receiver gets
 
@@ -159,7 +159,7 @@ go test -race ./...
 | `TestAuthRequired` | 401 without a key, and `/healthz` is open. |
 | Unit tests | Signature sign and verify (tampering, wrong secret, stale timestamp) and backoff bounds. |
 
-**Benchmark** (wipes the demo tables):
+**Benchmark** (wipes the demo tables). Both `scripts/demo.sh` and the bench refuse to run if `DATABASE_URL` points anywhere other than localhost. The bench binary takes `-allow-remote-db` to override this.
 
 ```bash
 ./bench/run.sh

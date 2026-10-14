@@ -13,6 +13,13 @@ cd "$(dirname "$0")/.."
 
 if [[ -f .env ]]; then set -a; . ./.env; set +a; else set -a; . ./.env.example; set +a; fi
 
+# The demo wipes tables; refuse to run against anything but a local database.
+DB_HOST=$(sed -E 's#^[a-z]+://([^@/]*@)?(\[[^]]*\]|[^:/?]*).*#\2#' <<<"$DATABASE_URL")
+case "$DB_HOST" in
+  localhost|127.0.0.1|"[::1]") ;;
+  *) echo "refusing to run: DATABASE_URL host '$DB_HOST' is not local (the demo wipes tables)" >&2; exit 1 ;;
+esac
+
 # Short backoff so retries and dead letters happen within seconds.
 export BACKOFF_BASE="${DEMO_BACKOFF_BASE:-100ms}" BACKOFF_MAX="${DEMO_BACKOFF_MAX:-2s}"
 export MAX_ATTEMPTS="${DEMO_MAX_ATTEMPTS:-6}"
