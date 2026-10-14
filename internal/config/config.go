@@ -46,6 +46,11 @@ type Config struct {
 	BreakerThreshold    int
 	BreakerCooldown     time.Duration
 	BreakerMaxCooldown  time.Duration
+
+	// Finished deliveries and their events older than RetentionPeriod are
+	// deleted every RetentionInterval. 0 disables retention.
+	RetentionPeriod   time.Duration
+	RetentionInterval time.Duration
 }
 
 // Load reads the configuration from the environment, applying defaults.
@@ -80,6 +85,12 @@ func Load() (Config, error) {
 		return c, err
 	}
 	if c.BreakerMaxCooldown, err = durationEnv("BREAKER_MAX_COOLDOWN", 10*time.Minute); err != nil {
+		return c, err
+	}
+	if c.RetentionPeriod, err = durationEnv("RETENTION_PERIOD", 30*24*time.Hour); err != nil {
+		return c, err
+	}
+	if c.RetentionInterval, err = durationEnv("RETENTION_INTERVAL", time.Hour); err != nil {
 		return c, err
 	}
 	if c.WorkerCount, err = intEnv("WORKER_COUNT", 16); err != nil {
@@ -127,6 +138,8 @@ func Load() (Config, error) {
 		return c, errors.New("WORKER_COUNT must be >= 0")
 	case c.MaxAttempts < 1:
 		return c, errors.New("MAX_ATTEMPTS must be >= 1")
+	case c.RetentionPeriod < 0 || c.RetentionInterval <= 0:
+		return c, errors.New("RETENTION_PERIOD must be >= 0 and RETENTION_INTERVAL > 0")
 	case c.EndpointMaxInflight < 1:
 		return c, errors.New("ENDPOINT_MAX_INFLIGHT must be >= 1")
 	case c.BreakerThreshold < 0:

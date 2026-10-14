@@ -409,3 +409,49 @@ func (s *Store) RetryDelivery(ctx context.Context, id int64) (Delivery, error) {
 	}
 	return d, err
 }
+
+// DeleteFinishedDeliveries deletes up to batch delivered/dead deliveries
+// last updated before cutoff.
+func (s *Store) DeleteFinishedDeliveries(ctx context.Context, cutoff time.Time, batch int) (int64, error) {
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM deliveries WHERE id IN (
+			SELECT id FROM deliveries
+			WHERE status <> 'pending' AND updated_at < $1
+			LIMIT $2)`, cutoff, batch)
+	return tag.RowsAffected(), err
+}
+
+// DeleteOldEvents deletes up to batch events created before cutoff that no
+// longer have any deliveries. After this an event ID can be accepted again.
+func (s *Store) DeleteOldEvents(ctx context.Context, cutoff time.Time, batch int) (int64, error) {
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM events WHERE id IN (
+			SELECT e.id FROM events e
+			WHERE e.created_at < $1
+			  AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.event_id = e.id)
+			LIMIT $2)`, cutoff, batch)
+	return tag.RowsAffected(), err
+}
+
+// QueueStats is a point-in-time view of the queue for metrics.
+type QueueStats struct {
+	Pending           int64
+	Due               int64   // pending and due now (not leased, not scheduled later)
+	OldestDueSeconds  float64 // how long the oldest due delivery has been waiting
+	EndpointsPaused   int64
+	EndpointsDisabled int64
+}
+
+func (s *Store) QueueStats(ctx context.Context) (QueueStats, error) {
+	var q QueueStats
+	err := s.pool.QueryRow(ctx, `
+		SELECT
+		  (SELECT count(*) FROM deliveries WHERE status = 'pending'),
+		  (SELECT count(*) FROM deliveries WHERE status = 'pending' AND next_attempt_at <= now()),
+		  coalesce((SELECT extract(epoch FROM now() - min(next_attempt_at))::float8
+		            FROM deliveries WHERE status = 'pending' AND next_attempt_at <= now()), 0),
+		  (SELECT count(*) FROM endpoints WHERE paused_until > now()),
+		  (SELECT count(*) FROM endpoints WHERE disabled_at IS NOT NULL)`,
+	).Scan(&q.Pending, &q.Due, &q.OldestDueSeconds, &q.EndpointsPaused, &q.EndpointsDisabled)
+	return q, err
+}

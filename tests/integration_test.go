@@ -24,6 +24,8 @@ import (
 
 	"github.com/gnanreddy13/webhook-delivery/internal/api"
 	"github.com/gnanreddy13/webhook-delivery/internal/db"
+	"github.com/gnanreddy13/webhook-delivery/internal/metrics"
+	"github.com/gnanreddy13/webhook-delivery/internal/retention"
 	"github.com/gnanreddy13/webhook-delivery/internal/secretbox"
 	"github.com/gnanreddy13/webhook-delivery/internal/signing"
 	"github.com/gnanreddy13/webhook-delivery/internal/store"
@@ -680,5 +682,117 @@ func TestEndpointManagementAndRetry(t *testing.T) {
 	}
 	if code, _ := apiCall(t, srv, "POST", fmt.Sprintf("/deliveries/%d/retry", deadID), ""); code != http.StatusConflict {
 		t.Errorf("retrying a delivered delivery: HTTP %d, want 409", code)
+	}
+}
+
+// Retention deletes old finished deliveries and then events with no
+// deliveries left, never pending deliveries or recent rows.
+func TestRetention(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	st := store.New(pool, testBox)
+	ep, err := st.CreateEndpoint(ctx, "https://example.com/hook", []string{"t"}, "whsec_x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"old_done", "old_dead", "old_pending", "new_done"} {
+		if _, _, err := st.CreateEvent(ctx, store.Event{ID: id, Type: "t", Payload: json.RawMessage(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec := func(q string) {
+		if _, err := pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec(`UPDATE events SET created_at = now() - interval '40 days' WHERE id LIKE 'old_%'`)
+	exec(`UPDATE deliveries SET status = 'delivered', updated_at = now() - interval '40 days' WHERE event_id = 'old_done'`)
+	exec(`UPDATE deliveries SET status = 'dead', updated_at = now() - interval '40 days' WHERE event_id = 'old_dead'`)
+	exec(`UPDATE deliveries SET updated_at = now() - interval '40 days' WHERE event_id = 'old_pending'`)
+	exec(`UPDATE deliveries SET status = 'delivered' WHERE event_id = 'new_done'`)
+
+	m := metrics.New()
+	d, e := retention.RunOnce(ctx, st, 30*24*time.Hour, m)
+	if d != 2 || e != 2 {
+		t.Fatalf("deleted %d deliveries and %d events, want 2 and 2", d, e)
+	}
+	var remaining []string
+	rows, _ := pool.Query(ctx, `SELECT id FROM events ORDER BY id`)
+	for rows.Next() {
+		var id string
+		rows.Scan(&id)
+		remaining = append(remaining, id)
+	}
+	rows.Close()
+	if strings.Join(remaining, ",") != "new_done,old_pending" {
+		t.Errorf("remaining events: %v", remaining)
+	}
+	if countWhere(t, pool, "event_id = 'old_pending' AND status = 'pending'") != 1 {
+		t.Error("pending delivery was deleted")
+	}
+	// A deleted event ID can be accepted again.
+	if created, n, _ := st.CreateEvent(ctx, store.Event{ID: "old_done", Type: "t", Payload: json.RawMessage(`{}`)}); !created || n != 1 {
+		t.Errorf("re-sending a deleted event: created=%v deliveries=%d", created, n)
+	}
+	if m.RetentionDeliveries.Load() != 2 || m.RetentionEvents.Load() != 2 {
+		t.Error("retention metrics not updated")
+	}
+	_ = ep
+}
+
+func TestMetricsAndReadiness(t *testing.T) {
+	pool := testDB(t)
+	st := store.New(pool, testBox)
+	m := metrics.New()
+	srv := httptest.NewServer(api.NewRouter(st, api.Options{APIKey: apiKey, AllowPrivateDestinations: true, Metrics: m}))
+	defer srv.Close()
+
+	resp, _ := http.Get(srv.URL + "/readyz")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("/readyz: HTTP %d", resp.StatusCode)
+	}
+	resp, _ = http.Get(srv.URL + "/metrics")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("/metrics without key: HTTP %d, want 401", resp.StatusCode)
+	}
+
+	var n atomic.Int32
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if n.Add(1)%2 == 1 { // fail every other request
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer receiver.Close()
+	registerEndpoint(t, srv, receiver.URL)
+	for i := range 5 {
+		apiCall(t, srv, "POST", "/events", fmt.Sprintf(`{"id":"m_%d","type":"order.created","payload":{}}`, i))
+	}
+	apiCall(t, srv, "POST", "/events", `{"id":"m_0","type":"order.created","payload":{}}`)
+	startPool(t, st, func(c *worker.Config) { c.Workers, c.Metrics = 1, m })
+	waitFor(t, 5*time.Second, func() bool { return countWhere(t, pool, "status = 'delivered'") == 5 })
+
+	req, _ := http.NewRequest("GET", srv.URL+"/metrics", nil)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	for _, want := range []string{
+		`webhook_delivery_attempts_total{result="success"} 5`,
+		`webhook_delivery_attempts_total{result="failure"} 5`,
+		`webhook_deliveries_finished_total{status="delivered"} 5`,
+		`webhook_events_total{result="accepted"} 5`,
+		`webhook_events_total{result="duplicate"} 1`,
+		"webhook_queue_stats_up 1",
+		"webhook_deliveries_pending 0",
+		"webhook_delivery_attempt_duration_seconds_count 10",
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("metrics missing %q", want)
+		}
 	}
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/gnanreddy13/webhook-delivery/internal/metrics"
 	"github.com/gnanreddy13/webhook-delivery/internal/netguard"
 	"github.com/gnanreddy13/webhook-delivery/internal/store"
 )
@@ -30,6 +31,7 @@ type Options struct {
 	// AllowPrivateDestinations skips the registration-time SSRF check
 	// (local development only; the workers enforce it separately).
 	AllowPrivateDestinations bool
+	Metrics                  *metrics.Metrics // optional
 }
 
 type API struct {
@@ -40,6 +42,9 @@ type API struct {
 // NewRouter builds the HTTP handler. Every route except /healthz and
 // /readyz requires "Authorization: Bearer <APIKey>".
 func NewRouter(s *store.Store, opts Options) http.Handler {
+	if opts.Metrics == nil {
+		opts.Metrics = metrics.New()
+	}
 	a := &API{store: s, opts: opts}
 
 	r := chi.NewRouter()
@@ -72,6 +77,7 @@ func NewRouter(s *store.Store, opts Options) http.Handler {
 		r.Get("/deliveries", a.listDeliveries)
 		r.Get("/deliveries/{id}", a.getDelivery)
 		r.Post("/deliveries/{id}/retry", a.retryDelivery)
+		r.Get("/metrics", a.metrics)
 	})
 	return r
 }
@@ -218,6 +224,11 @@ func (a *API) createEvent(w http.ResponseWriter, r *http.Request) {
 		serverError(w, err)
 		return
 	}
+	if created {
+		a.opts.Metrics.EventsAccepted.Add(1)
+	} else {
+		a.opts.Metrics.EventsDuplicate.Add(1)
+	}
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"id":         ev.ID,
 		"duplicate":  !created,
@@ -285,6 +296,19 @@ func (a *API) retryDelivery(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusOK, d)
 	}
+}
+
+// metrics serves Prometheus text format. Like every route except the health
+// checks it needs the API key (Prometheus: authorization.credentials).
+func (a *API) metrics(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	q, err := a.store.QueueStats(ctx)
+	if err != nil {
+		slog.Warn("queue stats failed", "err", err)
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	a.opts.Metrics.Write(w, q, err)
 }
 
 func newSecret() (string, error) {

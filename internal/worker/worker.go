@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gnanreddy13/webhook-delivery/internal/metrics"
 	"github.com/gnanreddy13/webhook-delivery/internal/netguard"
 	"github.com/gnanreddy13/webhook-delivery/internal/signing"
 	"github.com/gnanreddy13/webhook-delivery/internal/store"
@@ -36,6 +37,7 @@ type Config struct {
 	// endpoint can't occupy every worker.
 	EndpointMaxInflight int
 	Breaker             store.BreakerConfig
+	Metrics             *metrics.Metrics // optional
 }
 
 type Pool struct {
@@ -50,6 +52,9 @@ func New(cfg Config, s *store.Store) *Pool {
 		// Checked on the resolved IP of every connection, so DNS tricks
 		// can't reach internal services.
 		dialer.Control = netguard.Control
+	}
+	if cfg.Metrics == nil {
+		cfg.Metrics = metrics.New()
 	}
 	return &Pool{
 		cfg:   cfg,
@@ -127,14 +132,18 @@ func (p *Pool) loop(ctx context.Context, id int) {
 // not use the shutdown context, so an in-flight attempt is finished and
 // recorded during graceful shutdown.
 func (p *Pool) process(log *slog.Logger, j store.Job) {
+	start := time.Now()
 	code, sendErr := p.send(j)
+	p.cfg.Metrics.ObserveAttempt(sendErr == nil, time.Since(start))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	var err error
 	if sendErr == nil {
-		err = p.store.MarkDelivered(ctx, j, code)
+		if err = p.store.MarkDelivered(ctx, j, code); err == nil {
+			p.cfg.Metrics.Delivered.Add(1)
+		}
 	} else {
 		attempts := j.Attempts + 1
 		dead := attempts >= p.cfg.MaxAttempts
@@ -145,6 +154,7 @@ func (p *Pool) process(log *slog.Logger, j store.Job) {
 		}
 		err = p.store.MarkFailed(ctx, j, codePtr, truncate(sendErr.Error(), 500), dead, next)
 		if dead && err == nil {
+			p.cfg.Metrics.Dead.Add(1)
 			log.Warn("delivery dead", "delivery", j.DeliveryID, "attempts", attempts, "last_error", sendErr)
 		}
 	}
@@ -158,6 +168,7 @@ func (p *Pool) process(log *slog.Logger, j store.Job) {
 	if err != nil {
 		log.Error("updating endpoint health failed", "endpoint", j.EndpointID, "err", err)
 	} else if pausedUntil != nil {
+		p.cfg.Metrics.EndpointPauses.Add(1)
 		log.Warn("circuit breaker: endpoint paused after consecutive failures",
 			"endpoint", j.EndpointID, "until", pausedUntil.Format(time.RFC3339), "last_error", sendErr)
 	}

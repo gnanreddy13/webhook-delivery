@@ -15,6 +15,8 @@ import (
 	"github.com/gnanreddy13/webhook-delivery/internal/api"
 	"github.com/gnanreddy13/webhook-delivery/internal/config"
 	"github.com/gnanreddy13/webhook-delivery/internal/db"
+	"github.com/gnanreddy13/webhook-delivery/internal/metrics"
+	"github.com/gnanreddy13/webhook-delivery/internal/retention"
 	"github.com/gnanreddy13/webhook-delivery/internal/secretbox"
 	"github.com/gnanreddy13/webhook-delivery/internal/store"
 	"github.com/gnanreddy13/webhook-delivery/internal/worker"
@@ -59,9 +61,10 @@ func run() error {
 	} else if n > 0 {
 		slog.Info("re-encrypted endpoint secrets with the current key", "count", n)
 	}
+	m := metrics.New()
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           api.NewRouter(st, api.Options{APIKey: cfg.APIKey, AllowPrivateDestinations: cfg.AllowPrivateDestinations}),
+		Handler:           api.NewRouter(st, api.Options{APIKey: cfg.APIKey, AllowPrivateDestinations: cfg.AllowPrivateDestinations, Metrics: m}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -81,6 +84,7 @@ func run() error {
 
 		AllowPrivateDestinations: cfg.AllowPrivateDestinations,
 		EndpointMaxInflight:      cfg.EndpointMaxInflight,
+		Metrics:                  m,
 		Breaker: store.BreakerConfig{
 			Threshold:   cfg.BreakerThreshold,
 			Cooldown:    cfg.BreakerCooldown,
@@ -92,6 +96,12 @@ func run() error {
 		workers.Run(ctx)
 		close(workersDone)
 	}()
+
+	if cfg.RetentionPeriod > 0 {
+		go retention.Run(ctx, st, cfg.RetentionPeriod, cfg.RetentionInterval, m)
+	} else {
+		slog.Warn("RETENTION_PERIOD=0: old deliveries and events are never deleted")
+	}
 
 	errc := make(chan error, 1)
 	go func() {
