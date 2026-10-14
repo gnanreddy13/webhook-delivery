@@ -13,12 +13,16 @@ WORKERS_LIST="${BENCH_WORKERS:-1 4 16 32}"
 FAIL_RATES="${BENCH_FAIL_RATES:-0 0.3}"
 EVENTS="${BENCH_EVENTS:-10000}"
 CONCURRENCY="${BENCH_CONCURRENCY:-32}"
+ENDPOINTS="${BENCH_ENDPOINTS:-1}"
 # Short backoff so a 30%-failure run drains in seconds rather than minutes.
 export BACKOFF_BASE="${BENCH_BACKOFF_BASE:-100ms}" BACKOFF_MAX="${BENCH_BACKOFF_MAX:-2s}"
 export MAX_ATTEMPTS="${BENCH_MAX_ATTEMPTS:-8}"
 export DB_MAX_CONNS="${BENCH_DB_MAX_CONNS:-40}"
 # The receiver runs on localhost, so SSRF protection must be off for the bench.
 export ALLOW_PRIVATE_DESTINATIONS=true
+# One endpoint receives everything here, so let it use every worker, and
+# keep the breaker from pausing the flaky receiver: this measures the queue.
+export BREAKER_THRESHOLD=0
 LOG_DIR="$(mktemp -d)"
 
 go build -o bin/server ./cmd/server
@@ -31,7 +35,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "events=$EVENTS concurrency=$CONCURRENCY max_attempts=$MAX_ATTEMPTS backoff=$BACKOFF_BASE..$BACKOFF_MAX db_max_conns=$DB_MAX_CONNS"
+echo "events=$EVENTS endpoints=$ENDPOINTS concurrency=$CONCURRENCY max_attempts=$MAX_ATTEMPTS backoff=$BACKOFF_BASE..$BACKOFF_MAX db_max_conns=$DB_MAX_CONNS"
 echo "host: $(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m), logs in $LOG_DIR"
 
 for rate in $FAIL_RATES; do
@@ -40,11 +44,12 @@ for rate in $FAIL_RATES; do
   RECEIVER_FAIL_RATE="$rate" ./bin/receiver >"$LOG_DIR/receiver-$rate.log" 2>&1 &
   RECV_PID=$!
   for w in $WORKERS_LIST; do
-    WORKER_COUNT="$w" ./bin/server >"$LOG_DIR/server-$rate-$w.log" 2>&1 &
+    WORKER_COUNT="$w" ENDPOINT_MAX_INFLIGHT="$w" ./bin/server >"$LOG_DIR/server-$rate-$w.log" 2>&1 &
     SERVER_PID=$!
     for _ in $(seq 50); do curl -sf "http://$LISTEN_ADDR/healthz" >/dev/null && break; sleep 0.2; done
     ./bin/bench -api "http://$LISTEN_ADDR" -receiver "http://$RECEIVER_ADDR/hook" \
-      -events "$EVENTS" -concurrency "$CONCURRENCY" -label "workers=$w receiver_fail_rate=$rate"
+      -events "$EVENTS" -concurrency "$CONCURRENCY" -endpoints "$ENDPOINTS" \
+      -label "workers=$w endpoints=$ENDPOINTS receiver_fail_rate=$rate"
     kill -TERM "$SERVER_PID"; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=
   done
   kill "$RECV_PID"; wait "$RECV_PID" 2>/dev/null || true; RECV_PID=

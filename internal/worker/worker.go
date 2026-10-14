@@ -32,6 +32,10 @@ type Config struct {
 	PollInterval time.Duration
 	// AllowPrivateDestinations disables the SSRF dial check (local dev only).
 	AllowPrivateDestinations bool
+	// EndpointMaxInflight caps concurrent attempts per endpoint so one slow
+	// endpoint can't occupy every worker.
+	EndpointMaxInflight int
+	Breaker             store.BreakerConfig
 }
 
 type Pool struct {
@@ -84,9 +88,13 @@ func (p *Pool) Run(ctx context.Context) {
 
 func (p *Pool) loop(ctx context.Context, id int) {
 	log := slog.With("worker", id)
+	// When nothing is claimable, back off from a few ms up to PollInterval.
+	// Short sleeps first because an empty claim is often just another
+	// worker holding the endpoint's claim lock for a moment.
+	idle := time.Duration(0)
 	for ctx.Err() == nil {
 		leaseEnd := time.Now().Add(p.cfg.Lease)
-		jobs, err := p.store.ClaimDue(ctx, p.cfg.BatchSize, p.cfg.Lease)
+		jobs, err := p.store.ClaimDue(ctx, p.cfg.BatchSize, p.cfg.Lease, p.cfg.EndpointMaxInflight)
 		if err != nil {
 			if ctx.Err() == nil {
 				log.Error("claim failed", "err", err)
@@ -95,9 +103,11 @@ func (p *Pool) loop(ctx context.Context, id int) {
 			continue
 		}
 		if len(jobs) == 0 {
-			sleep(ctx, p.cfg.PollInterval)
+			idle = min(max(2*idle, 2*time.Millisecond), p.cfg.PollInterval)
+			sleep(ctx, idle/2+rand.N(idle/2+1))
 			continue
 		}
+		idle = 0
 		for i, j := range jobs {
 			// Hand the unsent rest back if we are shutting down, or if the
 			// lease could expire mid-attempt (slow receivers with batches
@@ -142,6 +152,14 @@ func (p *Pool) process(log *slog.Logger, j store.Job) {
 		log.Warn("lease expired before result was recorded", "delivery", j.DeliveryID)
 	} else if err != nil {
 		log.Error("recording result failed", "delivery", j.DeliveryID, "err", err)
+	}
+
+	pausedUntil, err := p.store.RecordEndpointResult(ctx, j.EndpointID, sendErr == nil, p.cfg.Breaker)
+	if err != nil {
+		log.Error("updating endpoint health failed", "endpoint", j.EndpointID, "err", err)
+	} else if pausedUntil != nil {
+		log.Warn("circuit breaker: endpoint paused after consecutive failures",
+			"endpoint", j.EndpointID, "until", pausedUntil.Format(time.RFC3339), "last_error", sendErr)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -62,9 +63,15 @@ func NewRouter(s *store.Store, opts Options) http.Handler {
 	r.Group(func(r chi.Router) {
 		r.Use(a.requireAPIKey)
 		r.Post("/endpoints", a.createEndpoint)
+		r.Get("/endpoints", a.listEndpoints)
+		r.Get("/endpoints/{id}", a.getEndpoint)
+		r.Post("/endpoints/{id}/disable", a.setEndpointDisabled(true))
+		r.Post("/endpoints/{id}/enable", a.setEndpointDisabled(false))
+		r.Post("/endpoints/{id}/rotate-secret", a.rotateSecret)
 		r.Post("/events", a.createEvent)
 		r.Get("/deliveries", a.listDeliveries)
 		r.Get("/deliveries/{id}", a.getDelivery)
+		r.Post("/deliveries/{id}/retry", a.retryDelivery)
 	})
 	return r
 }
@@ -124,6 +131,72 @@ func (a *API) createEndpoint(w http.ResponseWriter, r *http.Request) {
 	}
 	// The secret is only ever returned here, at creation time.
 	writeJSON(w, http.StatusCreated, ep)
+}
+
+func (a *API) listEndpoints(w http.ResponseWriter, r *http.Request) {
+	eps, err := a.store.ListEndpoints(r.Context())
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"endpoints": eps})
+}
+
+func (a *API) getEndpoint(w http.ResponseWriter, r *http.Request) {
+	id, ok := endpointID(w, r)
+	if !ok {
+		return
+	}
+	ep, err := a.store.GetEndpoint(r.Context(), id)
+	writeEndpoint(w, ep, err)
+}
+
+func (a *API) setEndpointDisabled(disabled bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, ok := endpointID(w, r)
+		if !ok {
+			return
+		}
+		ep, err := a.store.SetEndpointDisabled(r.Context(), id, disabled)
+		writeEndpoint(w, ep, err)
+	}
+}
+
+func (a *API) rotateSecret(w http.ResponseWriter, r *http.Request) {
+	id, ok := endpointID(w, r)
+	if !ok {
+		return
+	}
+	secret, err := newSecret()
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	// The new secret is returned only here.
+	ep, err := a.store.RotateEndpointSecret(r.Context(), id, secret)
+	writeEndpoint(w, ep, err)
+}
+
+func writeEndpoint(w http.ResponseWriter, ep store.Endpoint, err error) {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeError(w, http.StatusNotFound, "endpoint not found")
+	case err != nil:
+		serverError(w, err)
+	default:
+		writeJSON(w, http.StatusOK, ep)
+	}
+}
+
+var uuidRE = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+func endpointID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	id := chi.URLParam(r, "id")
+	if !uuidRE.MatchString(id) {
+		writeError(w, http.StatusBadRequest, "invalid endpoint id")
+		return "", false
+	}
+	return id, true
 }
 
 func (a *API) createEvent(w http.ResponseWriter, r *http.Request) {
@@ -193,6 +266,25 @@ func (a *API) getDelivery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, d)
+}
+
+func (a *API) retryDelivery(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid delivery id")
+		return
+	}
+	d, err := a.store.RetryDelivery(r.Context(), id)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeError(w, http.StatusNotFound, "delivery not found")
+	case errors.Is(err, store.ErrNotDead):
+		writeError(w, http.StatusConflict, "only dead deliveries can be retried")
+	case err != nil:
+		serverError(w, err)
+	default:
+		writeJSON(w, http.StatusOK, d)
+	}
 }
 
 func newSecret() (string, error) {

@@ -41,6 +41,11 @@ type Config struct {
 	LeaseDuration   time.Duration
 	PollInterval    time.Duration
 	ClaimBatchSize  int
+
+	EndpointMaxInflight int
+	BreakerThreshold    int
+	BreakerCooldown     time.Duration
+	BreakerMaxCooldown  time.Duration
 }
 
 // Load reads the configuration from the environment, applying defaults.
@@ -65,7 +70,19 @@ func Load() (Config, error) {
 	if c.DBMaxConns, err = intEnv("DB_MAX_CONNS", 20); err != nil {
 		return c, err
 	}
-	if c.WorkerCount, err = intEnv("WORKER_COUNT", 4); err != nil {
+	if c.EndpointMaxInflight, err = intEnv("ENDPOINT_MAX_INFLIGHT", 4); err != nil {
+		return c, err
+	}
+	if c.BreakerThreshold, err = intEnv("BREAKER_THRESHOLD", 5); err != nil {
+		return c, err
+	}
+	if c.BreakerCooldown, err = durationEnv("BREAKER_COOLDOWN", 30*time.Second); err != nil {
+		return c, err
+	}
+	if c.BreakerMaxCooldown, err = durationEnv("BREAKER_MAX_COOLDOWN", 10*time.Minute); err != nil {
+		return c, err
+	}
+	if c.WorkerCount, err = intEnv("WORKER_COUNT", 16); err != nil {
 		return c, err
 	}
 	if c.MaxAttempts, err = intEnv("MAX_ATTEMPTS", 8); err != nil {
@@ -110,6 +127,10 @@ func Load() (Config, error) {
 		return c, errors.New("WORKER_COUNT must be >= 0")
 	case c.MaxAttempts < 1:
 		return c, errors.New("MAX_ATTEMPTS must be >= 1")
+	case c.EndpointMaxInflight < 1:
+		return c, errors.New("ENDPOINT_MAX_INFLIGHT must be >= 1")
+	case c.BreakerThreshold < 0:
+		return c, errors.New("BREAKER_THRESHOLD must be >= 0 (0 disables the circuit breaker)")
 	case c.ClaimBatchSize < 1:
 		return c, errors.New("CLAIM_BATCH_SIZE must be >= 1")
 	case c.LeaseDuration < c.DeliveryTimeout+2*time.Second:

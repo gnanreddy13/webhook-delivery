@@ -24,6 +24,9 @@ esac
 # The fake receiver runs on localhost, so the demo must turn SSRF protection
 # off. Never set this in a real deployment.
 export ALLOW_PRIVATE_DESTINATIONS=true
+# Circuit breaker off so the always-failing /fail endpoint reaches "dead"
+# within seconds instead of being paused (the breaker has its own tests).
+export BREAKER_THRESHOLD=0
 
 # Short backoff so retries and dead letters happen within seconds.
 export BACKOFF_BASE="${DEMO_BACKOFF_BASE:-100ms}" BACKOFF_MAX="${DEMO_BACKOFF_MAX:-2s}"

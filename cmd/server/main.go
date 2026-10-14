@@ -80,6 +80,12 @@ func run() error {
 		PollInterval: cfg.PollInterval,
 
 		AllowPrivateDestinations: cfg.AllowPrivateDestinations,
+		EndpointMaxInflight:      cfg.EndpointMaxInflight,
+		Breaker: store.BreakerConfig{
+			Threshold:   cfg.BreakerThreshold,
+			Cooldown:    cfg.BreakerCooldown,
+			MaxCooldown: cfg.BreakerMaxCooldown,
+		},
 	}, st)
 	workersDone := make(chan struct{})
 	go func() {

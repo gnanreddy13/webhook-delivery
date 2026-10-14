@@ -27,6 +27,7 @@ func main() {
 	target := flag.String("receiver", "http://127.0.0.1:9090/hook", "webhook URL to register")
 	events := flag.Int("events", 10000, "number of events to send")
 	concurrency := flag.Int("concurrency", 32, "concurrent POST /events clients")
+	endpoints := flag.Int("endpoints", 1, "number of endpoints; events are spread evenly across them")
 	timeout := flag.Duration("timeout", 10*time.Minute, "max time to wait for deliveries to finish")
 	label := flag.String("label", "", "label printed with the results")
 	allowRemote := flag.Bool("allow-remote-db", false, "allow a non-localhost database (its tables will be wiped)")
@@ -67,8 +68,13 @@ func main() {
 		resp.Body.Close()
 		return resp.StatusCode, nil
 	}
-	if code, err := post("/endpoints", fmt.Sprintf(`{"url":%q,"event_types":["bench.event"]}`, *target)); err != nil || code != http.StatusCreated {
-		log.Fatalf("register endpoint: HTTP %d %v", code, err)
+	// Endpoint k subscribes to "bench.event.k"; event i has type i % endpoints,
+	// so every event produces exactly one delivery.
+	for k := range *endpoints {
+		body := fmt.Sprintf(`{"url":"%s?ep=%d","event_types":["bench.event.%d"]}`, *target, k, k)
+		if code, err := post("/endpoints", body); err != nil || code != http.StatusCreated {
+			log.Fatalf("register endpoint: HTTP %d %v", code, err)
+		}
 	}
 
 	// Phase 1: send events and time each POST.
@@ -85,7 +91,8 @@ func main() {
 				if i >= int64(*events) {
 					return
 				}
-				body := fmt.Sprintf(`{"id":"bench_%d","type":"bench.event","payload":{"n":%d,"note":"benchmark payload"}}`, i, i)
+				body := fmt.Sprintf(`{"id":"bench_%d","type":"bench.event.%d","payload":{"n":%d,"note":"benchmark payload"}}`,
+					i, i%int64(*endpoints), i)
 				t0 := time.Now()
 				code, err := post("/events", body)
 				latencies[i] = time.Since(t0)
@@ -126,7 +133,8 @@ func main() {
 	pct := func(p float64) time.Duration { return latencies[int(float64(len(latencies)-1)*p)] }
 
 	fmt.Printf("\n=== %s\n", *label)
-	fmt.Printf("events sent:          %d (%d concurrent clients), non-202 responses: %d\n", *events, *concurrency, non202.Load())
+	fmt.Printf("events sent:          %d (%d concurrent clients) to %d endpoint(s), non-202 responses: %d\n",
+		*events, *concurrency, *endpoints, non202.Load())
 	fmt.Printf("ingest:               %.0f events/s over %v\n", float64(*events)/ingest.Seconds(), ingest.Round(time.Millisecond))
 	fmt.Printf("POST /events latency: p50 %v  p95 %v  p99 %v  max %v\n",
 		pct(0.50).Round(10*time.Microsecond), pct(0.95).Round(10*time.Microsecond),

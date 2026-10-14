@@ -77,26 +77,38 @@ func newRouter(st *store.Store) http.Handler {
 }
 
 // startWorkers runs a worker pool with fast retries until the test ends.
+// The per-endpoint cap and circuit breaker are effectively off unless a
+// test enables them through startPool.
 func startWorkers(t *testing.T, st *store.Store, workers, maxAttempts int) {
 	t.Helper()
-	startWorkersWith(t, st, workers, maxAttempts, true)
+	startPool(t, st, func(c *worker.Config) { c.Workers, c.MaxAttempts = workers, maxAttempts })
 }
 
 func startWorkersWith(t *testing.T, st *store.Store, workers, maxAttempts int, allowPrivate bool) {
 	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	p := worker.New(worker.Config{
-		Workers:      workers,
+	startPool(t, st, func(c *worker.Config) {
+		c.Workers, c.MaxAttempts, c.AllowPrivateDestinations = workers, maxAttempts, allowPrivate
+	})
+}
+
+func startPool(t *testing.T, st *store.Store, configure func(*worker.Config)) {
+	t.Helper()
+	cfg := worker.Config{
+		Workers:      4,
 		BatchSize:    1,
-		MaxAttempts:  maxAttempts,
+		MaxAttempts:  5,
 		BackoffBase:  10 * time.Millisecond,
 		BackoffMax:   50 * time.Millisecond,
 		Timeout:      2 * time.Second,
 		Lease:        10 * time.Second,
 		PollInterval: 10 * time.Millisecond,
 
-		AllowPrivateDestinations: allowPrivate,
-	}, st)
+		AllowPrivateDestinations: true,
+		EndpointMaxInflight:      1000,
+	}
+	configure(&cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	p := worker.New(cfg, st)
 	done := make(chan struct{})
 	go func() { p.Run(ctx); close(done) }()
 	t.Cleanup(func() { cancel(); <-done })
@@ -461,4 +473,212 @@ func TestSecretsEncryptedAtRest(t *testing.T) {
 		}
 	}
 	_ = ep
+}
+
+func registerFor(t *testing.T, srv *httptest.Server, target, eventType string) (id, secret string) {
+	t.Helper()
+	code, out := apiCall(t, srv, "POST", "/endpoints", fmt.Sprintf(`{"url":%q,"event_types":[%q]}`, target, eventType))
+	if code != http.StatusCreated {
+		t.Fatalf("register endpoint: HTTP %d %v", code, out)
+	}
+	return out["id"].(string), out["secret"].(string)
+}
+
+// One endpoint that hangs until the delivery timeout must not delay
+// deliveries to a healthy endpoint: the per-endpoint cap keeps it from
+// occupying every worker.
+func TestSlowEndpointDoesNotStallOthers(t *testing.T) {
+	pool := testDB(t)
+	st := store.New(pool, testBox)
+	srv := httptest.NewServer(newRouter(st))
+	defer srv.Close()
+
+	var inflight, maxInflight atomic.Int32
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := inflight.Add(1)
+		defer inflight.Add(-1)
+		for {
+			m := maxInflight.Load()
+			if n <= m || maxInflight.CompareAndSwap(m, n) {
+				break
+			}
+		}
+		select { // hang until the sender gives up
+		case <-r.Context().Done():
+		case <-time.After(1500 * time.Millisecond):
+		}
+	}))
+	defer slow.Close()
+	fast := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer fast.Close()
+
+	registerFor(t, srv, slow.URL, "slow.event")
+	registerFor(t, srv, fast.URL, "fast.event")
+	// Queue the slow endpoint's backlog first so it is oldest.
+	for i := range 40 {
+		apiCall(t, srv, "POST", "/events", fmt.Sprintf(`{"id":"slow_%d","type":"slow.event","payload":{}}`, i))
+	}
+	for i := range 40 {
+		apiCall(t, srv, "POST", "/events", fmt.Sprintf(`{"id":"fast_%d","type":"fast.event","payload":{}}`, i))
+	}
+
+	const workers, limit = 8, 2
+	start := time.Now()
+	startPool(t, st, func(c *worker.Config) {
+		c.Workers, c.EndpointMaxInflight = workers, limit
+		c.Timeout, c.MaxAttempts = time.Second, 100
+	})
+	waitFor(t, 5*time.Second, func() bool {
+		return countWhere(t, pool, "status = 'delivered' AND event_id LIKE 'fast_%'") == 40
+	})
+	elapsed := time.Since(start)
+	t.Logf("healthy endpoint: 40 deliveries in %v; slow endpoint max concurrent requests: %d (cap %d, workers %d)",
+		elapsed.Round(time.Millisecond), maxInflight.Load(), limit, workers)
+	if elapsed > 2*time.Second {
+		t.Errorf("healthy endpoint took %v; the slow endpoint is starving it", elapsed)
+	}
+	if maxInflight.Load() > limit {
+		t.Errorf("slow endpoint reached %d concurrent requests, cap is %d", maxInflight.Load(), limit)
+	}
+}
+
+// After BreakerThreshold consecutive failures the endpoint is paused: no
+// requests are sent and pending deliveries keep their remaining attempts.
+// Once it recovers, the backlog is delivered and the breaker resets.
+func TestCircuitBreaker(t *testing.T) {
+	pool := testDB(t)
+	st := store.New(pool, testBox)
+	srv := httptest.NewServer(newRouter(st))
+	defer srv.Close()
+
+	var healthy atomic.Bool
+	var hits atomic.Int32
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if !healthy.Load() {
+			w.WriteHeader(http.StatusBadGateway)
+		}
+	}))
+	defer receiver.Close()
+	epID, _ := registerFor(t, srv, receiver.URL, "order.created")
+
+	for i := range 20 {
+		apiCall(t, srv, "POST", "/events", fmt.Sprintf(`{"id":"cb_%d","type":"order.created","payload":{}}`, i))
+	}
+	startPool(t, st, func(c *worker.Config) {
+		c.Workers, c.EndpointMaxInflight, c.MaxAttempts = 4, 1, 3
+		c.Breaker = store.BreakerConfig{Threshold: 3, Cooldown: 700 * time.Millisecond, MaxCooldown: 700 * time.Millisecond}
+	})
+
+	waitFor(t, 5*time.Second, func() bool {
+		_, ep := apiCall(t, srv, "GET", "/endpoints/"+epID, "")
+		return ep["paused_until"] != nil
+	})
+	hitsWhenOpened := hits.Load()
+	time.Sleep(400 * time.Millisecond) // well inside the 700ms pause
+	if got := hits.Load(); got != hitsWhenOpened {
+		t.Errorf("requests were sent while the breaker was open: %d -> %d", hitsWhenOpened, got)
+	}
+	if n := countWhere(t, pool, "status = 'dead'"); n > 1 {
+		t.Errorf("%d deliveries died; a paused endpoint should not burn through attempts", n)
+	}
+	t.Logf("breaker opened after %d requests; %d deliveries still pending", hitsWhenOpened, countWhere(t, pool, "status = 'pending'"))
+
+	healthy.Store(true)
+	waitFor(t, 10*time.Second, func() bool { return countWhere(t, pool, "status = 'pending'") == 0 })
+	if n := countWhere(t, pool, "status = 'delivered'"); n < 19 {
+		t.Errorf("only %d of 20 delivered after recovery", n)
+	}
+	_, ep := apiCall(t, srv, "GET", "/endpoints/"+epID, "")
+	if ep["consecutive_failures"].(float64) != 0 || ep["paused_until"] != nil {
+		t.Errorf("breaker not reset after recovery: %v", ep)
+	}
+}
+
+func TestEndpointManagementAndRetry(t *testing.T) {
+	pool := testDB(t)
+	st := store.New(pool, testBox)
+	srv := httptest.NewServer(newRouter(st))
+	defer srv.Close()
+
+	var mu sync.Mutex
+	secret := ""
+	var accept atomic.Bool
+	var verified, rejected atomic.Int32
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		s := secret
+		mu.Unlock()
+		if signing.Verify(s, r.Header.Get(signing.TimestampHeader), r.Header.Get(signing.SignatureHeader), body, time.Minute, time.Now()) != nil {
+			rejected.Add(1)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		verified.Add(1)
+		if !accept.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer receiver.Close()
+
+	id, s := registerFor(t, srv, receiver.URL, "order.created")
+	mu.Lock()
+	secret = s
+	mu.Unlock()
+
+	// List and get never expose secrets.
+	_, list := apiCall(t, srv, "GET", "/endpoints", "")
+	if eps := list["endpoints"].([]any); len(eps) != 1 || eps[0].(map[string]any)["secret"] != nil {
+		t.Fatalf("unexpected endpoint list: %v", list)
+	}
+	if code, _ := apiCall(t, srv, "GET", "/endpoints/not-a-uuid", ""); code != http.StatusBadRequest {
+		t.Errorf("bad id: HTTP %d", code)
+	}
+	if code, _ := apiCall(t, srv, "GET", "/endpoints/00000000-0000-0000-0000-000000000000", ""); code != http.StatusNotFound {
+		t.Errorf("unknown id: HTTP %d", code)
+	}
+
+	// Disabled: no deliveries are created for new events.
+	if code, ep := apiCall(t, srv, "POST", "/endpoints/"+id+"/disable", ""); code != http.StatusOK || ep["disabled_at"] == nil {
+		t.Fatalf("disable: HTTP %d %v", code, ep)
+	}
+	if _, out := apiCall(t, srv, "POST", "/events", `{"id":"while_disabled","type":"order.created","payload":{}}`); out["deliveries"].(float64) != 0 {
+		t.Errorf("disabled endpoint got a delivery: %v", out)
+	}
+	apiCall(t, srv, "POST", "/endpoints/"+id+"/enable", "")
+
+	// Fail until dead, then retry it after the receiver recovers.
+	startWorkers(t, st, 2, 2)
+	apiCall(t, srv, "POST", "/events", `{"id":"to_retry","type":"order.created","payload":{}}`)
+	waitFor(t, 5*time.Second, func() bool { return countWhere(t, pool, "status = 'dead'") == 1 })
+	var deadID int64
+	pool.QueryRow(context.Background(), "SELECT id FROM deliveries WHERE status = 'dead'").Scan(&deadID)
+
+	if code, _ := apiCall(t, srv, "POST", fmt.Sprintf("/deliveries/%d/retry", deadID+1000), ""); code != http.StatusNotFound {
+		t.Errorf("retry unknown delivery: HTTP %d", code)
+	}
+
+	// Rotate the secret; the receiver now only accepts the new one.
+	code, rotated := apiCall(t, srv, "POST", "/endpoints/"+id+"/rotate-secret", "")
+	if code != http.StatusOK || rotated["secret"] == nil || rotated["secret"] == s {
+		t.Fatalf("rotate: HTTP %d %v", code, rotated)
+	}
+	mu.Lock()
+	secret = rotated["secret"].(string)
+	mu.Unlock()
+	accept.Store(true)
+	rejected.Store(0)
+
+	code, d := apiCall(t, srv, "POST", fmt.Sprintf("/deliveries/%d/retry", deadID), "")
+	if code != http.StatusOK || d["status"] != "pending" || d["attempts"].(float64) != 0 {
+		t.Fatalf("retry: HTTP %d %v", code, d)
+	}
+	waitFor(t, 5*time.Second, func() bool { return countWhere(t, pool, "status = 'delivered'") == 1 })
+	if rejected.Load() != 0 {
+		t.Errorf("%d requests after rotation were signed with the old secret", rejected.Load())
+	}
+	if code, _ := apiCall(t, srv, "POST", fmt.Sprintf("/deliveries/%d/retry", deadID), ""); code != http.StatusConflict {
+		t.Errorf("retrying a delivered delivery: HTTP %d, want 409", code)
+	}
 }
