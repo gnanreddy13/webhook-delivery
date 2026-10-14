@@ -12,9 +12,18 @@ import (
 	"github.com/gnanreddy13/webhook-delivery/migrations"
 )
 
-// Connect opens a pool and checks that the database is reachable.
-func Connect(ctx context.Context, url string) (*pgxpool.Pool, error) {
-	pool, err := pgxpool.New(ctx, url)
+// Connect opens a pool and checks that the database is reachable. If
+// maxConns > 0 it overrides pgxpool's default (max(4, NumCPU)), which is too
+// small once every worker and the API need a connection at the same time.
+func Connect(ctx context.Context, url string, maxConns int) (*pgxpool.Pool, error) {
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return nil, err
+	}
+	if maxConns > 0 {
+		cfg.MaxConns = int32(maxConns)
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}

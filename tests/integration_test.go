@@ -37,7 +37,7 @@ func testDB(t *testing.T) *pgxpool.Pool {
 	ctx := context.Background()
 
 	adminURL := envOr("DATABASE_URL", "postgres://webhook:change-me-local-only@127.0.0.1:5432/webhook?sslmode=disable")
-	admin, err := db.Connect(ctx, adminURL)
+	admin, err := db.Connect(ctx, adminURL, 0)
 	if err != nil {
 		t.Skipf("Postgres not reachable (start it with docker compose up -d): %v", err)
 	}
@@ -50,7 +50,7 @@ func testDB(t *testing.T) *pgxpool.Pool {
 
 	u, _ := url.Parse(adminURL)
 	u.Path = "/webhook_test"
-	pool, err := db.Connect(ctx, u.String())
+	pool, err := db.Connect(ctx, u.String(), 30)
 	if err != nil {
 		t.Fatal(err)
 	}

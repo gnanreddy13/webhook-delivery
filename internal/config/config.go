@@ -11,6 +11,7 @@ import (
 
 type Config struct {
 	DatabaseURL string
+	DBMaxConns  int
 	ListenAddr  string
 	APIKey      string
 
@@ -32,6 +33,9 @@ func Load() (Config, error) {
 		APIKey:      os.Getenv("API_KEY"),
 	}
 	var err error
+	if c.DBMaxConns, err = intEnv("DB_MAX_CONNS", 20); err != nil {
+		return c, err
+	}
 	if c.WorkerCount, err = intEnv("WORKER_COUNT", 4); err != nil {
 		return c, err
 	}
@@ -60,6 +64,8 @@ func Load() (Config, error) {
 	switch {
 	case c.APIKey == "":
 		return c, errors.New("API_KEY must be set")
+	case c.DBMaxConns < 2:
+		return c, errors.New("DB_MAX_CONNS must be >= 2")
 	case c.WorkerCount < 0:
 		return c, errors.New("WORKER_COUNT must be >= 0")
 	case c.MaxAttempts < 1:

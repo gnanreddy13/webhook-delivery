@@ -31,10 +31,14 @@ func run() error {
 		return err
 	}
 
+	if cfg.APIKey == "change-me" {
+		slog.Warn("API_KEY is the placeholder from .env.example; set a real one (openssl rand -hex 32)")
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := db.Connect(ctx, cfg.DatabaseURL)
+	pool, err := db.Connect(ctx, cfg.DatabaseURL, cfg.DBMaxConns)
 	if err != nil {
 		return err
 	}
