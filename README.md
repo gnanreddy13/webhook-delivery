@@ -1,5 +1,7 @@
 # webhook-delivery
 
+[![CI](https://github.com/gnanreddy13/webhook-delivery/actions/workflows/ci.yml/badge.svg)](https://github.com/gnanreddy13/webhook-delivery/actions/workflows/ci.yml)
+
 A webhook delivery service in Go and PostgreSQL. You register endpoints and send events. The service fans each event out to every subscribed endpoint, signs each request, retries failures with exponential backoff, and gives up after a configurable number of attempts.
 
 Postgres is the only infrastructure. The queue is the `deliveries` table, and workers claim rows with `FOR UPDATE SKIP LOCKED`.
@@ -16,7 +18,7 @@ Postgres is the only infrastructure. The queue is the `deliveries` table, and wo
 
 ## Quick start
 
-Requirements: Go 1.25+ (tested with 1.25.14 and 1.27.1; see [Platforms tested](#platforms-tested)), Docker (with Compose v2) and `curl`. From a fresh clone:
+Requirements: Go 1.25+ (tested with 1.25.0 through 1.27.2; see [Platforms tested](#platforms-tested)), Docker (with Compose v2) and `curl`. From a fresh clone:
 
 ```bash
 ./scripts/init-env.sh
@@ -285,7 +287,10 @@ With realistic receiver latency, workers spend almost all their time waiting on 
 ### Platforms tested
 
 - macOS 27 (Apple Silicon), Go 1.27.1: demo, tests with `-race`, all benchmarks, and the container image.
-- Linux (Debian 13, arm64, in a `golang:1.25` container on Docker Desktop), Go 1.25.14: `go vet` and all tests with `-race`. Native x86-64 Linux has not been tested.
+- Linux (Debian 13, arm64, in a `golang:1.25` container on Docker Desktop), Go 1.25.14: `go vet` and all tests with `-race`.
+- Native x86-64 Linux, through [CI](.github/workflows/ci.yml) on GitHub's Ubuntu 24.04 runners on every push:
+  - gofmt, `go vet` and all tests with `-race` against a Postgres 16 service, on Go 1.25.14 and the latest stable Go (1.27.2 at the time of writing). In CI the integration tests fail instead of skipping if Postgres is unreachable.
+  - The README quick start (`init-env.sh`, `docker compose up`, `demo.sh`) and a container image build, on Go 1.25.0.
 
 ## Limitations
 
