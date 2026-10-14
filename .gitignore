@@ -1,0 +1,5 @@
+.env
+/bin/
+*.log
+/bench/results/
+.DS_Store
