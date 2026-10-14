@@ -16,5 +16,27 @@ services:
       timeout: 3s
       retries: 30
 
+  # The server itself, built from the Dockerfile. Opt-in:
+  #   docker compose --profile app up -d --build
+  # It is published on 127.0.0.1 only and speaks plain HTTP; for anything
+  # reachable from other machines, put a TLS-terminating reverse proxy in
+  # front (or set TLS_CERT_FILE/TLS_KEY_FILE and mount the files).
+  server:
+    profiles: ["app"]
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      LISTEN_ADDR: 0.0.0.0:8080
+      # Inside the container the server must listen on all interfaces; the
+      # port is published to the host's loopback only (below).
+      ALLOW_INSECURE_HTTP: "true"
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   pgdata:
