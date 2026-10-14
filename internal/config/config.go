@@ -38,7 +38,7 @@ func Load() (Config, error) {
 	if c.MaxAttempts, err = intEnv("MAX_ATTEMPTS", 8); err != nil {
 		return c, err
 	}
-	if c.ClaimBatchSize, err = intEnv("CLAIM_BATCH_SIZE", 10); err != nil {
+	if c.ClaimBatchSize, err = intEnv("CLAIM_BATCH_SIZE", 1); err != nil {
 		return c, err
 	}
 	if c.BackoffBase, err = durationEnv("BACKOFF_BASE", time.Second); err != nil {
@@ -66,8 +66,8 @@ func Load() (Config, error) {
 		return c, errors.New("MAX_ATTEMPTS must be >= 1")
 	case c.ClaimBatchSize < 1:
 		return c, errors.New("CLAIM_BATCH_SIZE must be >= 1")
-	case c.LeaseDuration <= c.DeliveryTimeout:
-		return c, errors.New("LEASE_DURATION must be longer than DELIVERY_TIMEOUT")
+	case c.LeaseDuration < c.DeliveryTimeout+2*time.Second:
+		return c, errors.New("LEASE_DURATION must be at least DELIVERY_TIMEOUT + 2s")
 	}
 	return c, nil
 }

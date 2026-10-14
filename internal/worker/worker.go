@@ -71,6 +71,7 @@ func (p *Pool) Run(ctx context.Context) {
 func (p *Pool) loop(ctx context.Context, id int) {
 	log := slog.With("worker", id)
 	for ctx.Err() == nil {
+		leaseEnd := time.Now().Add(p.cfg.Lease)
 		jobs, err := p.store.ClaimDue(ctx, p.cfg.BatchSize, p.cfg.Lease)
 		if err != nil {
 			if ctx.Err() == nil {
@@ -84,13 +85,14 @@ func (p *Pool) loop(ctx context.Context, id int) {
 			continue
 		}
 		for i, j := range jobs {
-			if ctx.Err() != nil {
-				// Shutting down: hand the unsent rest back instead of
-				// waiting for their leases to expire.
+			// Hand the unsent rest back if we are shutting down, or if the
+			// lease could expire mid-attempt (slow receivers with batches
+			// > 1), which would let another worker send the same row.
+			if ctx.Err() != nil || time.Until(leaseEnd) < p.cfg.Timeout+time.Second {
 				if err := p.store.Release(context.Background(), jobs[i:]); err != nil {
 					log.Error("release failed", "err", err)
 				}
-				return
+				break
 			}
 			p.process(log, j)
 		}
