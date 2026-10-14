@@ -37,7 +37,9 @@ to reproduce them, see [testing](testing.md#running--testing).
 | 16 | 1,200 | 1,118–1,235 |
 | 32 | 1,202 | 1,185–1,237 |
 
-past about 4 workers, a single endpoint sits around 1,100–1,300/s, because its claims are serialized to keep the in-flight cap exact (see [how it works](design.md)). POST /events p95 was 5.7–6.6 ms in these runs.
+past about 4 workers, a single endpoint sits around 1,000–1,300/s, because its claims are serialized to keep the in-flight cap exact (see [how it works](design.md)). POST /events p95 was 5.7–6.6 ms in these runs.
+
+**after the migration 005 fix.** the tables above were measured before the fix. a recheck afterwards gave 996–1,219 deliveries/s for one endpoint (4, 16 and 32 workers, 3–4 runs each) and 2,392–3,403/s for 16 endpoints (16 and 32 workers, 3 runs each), so roughly the same, with the single-endpoint ceiling maybe a little lower.
 
 **earlier version, for comparison.** the previous version claimed the globally oldest row with a single `SKIP LOCKED` query and had no per-endpoint isolation. it reached a median of about 4,500/s on one endpoint with 32 workers (5 runs, same machine). the current version trades that peak for isolation: exact caps, fair claiming, and the circuit breaker.
 

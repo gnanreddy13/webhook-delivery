@@ -98,7 +98,7 @@ kafka (or similar) starts paying off at much higher volume, or when lots of inde
 | what | result |
 |---|---|
 | total throughput, 16 endpoints, 32 workers, instant receiver | 3,230 deliveries/s (median of 3 runs) |
-| a single endpoint (per-endpoint ceiling) | about 1,100–1,300 deliveries/s |
+| a single endpoint (per-endpoint ceiling) | about 1,000–1,300 deliveries/s |
 | receiver taking 50 ms per request, 128 workers | 2,261 deliveries/s (88% of the ideal) |
 | receiver failing 30% of requests | 99.98–100% delivered, about 1.43 attempts on average |
 | POST /events p95 | 5.5–9.8 ms |
@@ -116,7 +116,7 @@ all measured on my macbook over localhost, so read them as a ceiling, not a capa
 ## limitations...
 
 - **single tenant, single api key:** no per-client keys, scopes or api rate limiting.
-- **per-endpoint throughput:** one endpoint tops out around 1,100–1,300 deliveries/s on my machine, because its claims are serialized (see [docs/design.md](docs/design.md)).
+- **per-endpoint throughput:** one endpoint tops out around 1,000–1,300 deliveries/s on my machine, because its claims are serialized (see [docs/design.md](docs/design.md)).
 - **endpoint count:** claiming looks at every eligible endpoint, and the benchmarks used at most 16. very large endpoint counts (tens of thousands) are untested.
 - **delivery guarantees:** at-least-once and unordered.
 - **attempt history:** only the latest attempt's `last_status_code` and `last_error` are kept.

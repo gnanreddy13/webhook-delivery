@@ -496,43 +496,74 @@ func registerFor(t *testing.T, srv *httptest.Server, target, eventType string) (
 	return out["id"].(string), out["secret"].(string)
 }
 
-// One endpoint that hangs until the delivery timeout must not delay
-// deliveries to a healthy endpoint: the per-endpoint cap keeps it from
-// occupying every worker.
-func TestSlowEndpointDoesNotStallOthers(t *testing.T) {
+// isolationResult is what runIsolation observed.
+type isolationResult struct {
+	healthyDone  time.Duration // time until all healthy deliveries were delivered
+	senderPeak   int           // max leased (in-flight) deliveries for the slow endpoint, sampled from the DB
+	receiverPeak int           // max concurrent requests the slow receiver saw
+	slowAttempts int           // requests the slow receiver got
+}
+
+// runIsolation queues 40 deliveries for a slow endpoint (oldest) and 40 for
+// a healthy one, starts 8 workers with an in-flight cap of 2 and a 1s
+// delivery timeout, and measures how quickly the healthy endpoint is
+// served and how many attempts the slow endpoint ever has in flight.
+func runIsolation(t *testing.T, slowHandler func(http.ResponseWriter, *http.Request)) isolationResult {
+	t.Helper()
 	pool := testDB(t)
 	st := store.New(pool, testBox)
 	srv := httptest.NewServer(newRouter(st))
 	defer srv.Close()
 
-	var inflight, maxInflight atomic.Int32
+	var inflight, receiverPeak, slowAttempts atomic.Int32
 	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		slowAttempts.Add(1)
 		n := inflight.Add(1)
 		defer inflight.Add(-1)
 		for {
-			m := maxInflight.Load()
-			if n <= m || maxInflight.CompareAndSwap(m, n) {
+			m := receiverPeak.Load()
+			if n <= m || receiverPeak.CompareAndSwap(m, n) {
 				break
 			}
 		}
-		select { // hang until the sender gives up
-		case <-r.Context().Done():
-		case <-time.After(1500 * time.Millisecond):
-		}
+		slowHandler(w, r)
 	}))
 	defer slow.Close()
 	fast := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	defer fast.Close()
 
-	registerFor(t, srv, slow.URL, "slow.event")
+	slowID, _ := registerFor(t, srv, slow.URL, "slow.event")
 	registerFor(t, srv, fast.URL, "fast.event")
-	// Queue the slow endpoint's backlog first so it is oldest.
+	// Queue the slow endpoint's backlog first so it is the oldest work.
 	for i := range 40 {
 		apiCall(t, srv, "POST", "/events", fmt.Sprintf(`{"id":"slow_%d","type":"slow.event","payload":{}}`, i))
 	}
 	for i := range 40 {
 		apiCall(t, srv, "POST", "/events", fmt.Sprintf(`{"id":"fast_%d","type":"fast.event","payload":{}}`, i))
 	}
+
+	// Sample the sender's own view of in-flight attempts: live leases.
+	var senderPeak atomic.Int32
+	stopSampling := make(chan struct{})
+	samplerDone := make(chan struct{})
+	go func() {
+		defer close(samplerDone)
+		for {
+			select {
+			case <-stopSampling:
+				return
+			default:
+			}
+			var n int32
+			pool.QueryRow(context.Background(),
+				`SELECT count(*) FROM deliveries WHERE endpoint_id = $1 AND lease_expires_at > clock_timestamp()`,
+				slowID).Scan(&n)
+			if n > senderPeak.Load() {
+				senderPeak.Store(n)
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
 
 	const workers, limit = 8, 2
 	start := time.Now()
@@ -543,15 +574,55 @@ func TestSlowEndpointDoesNotStallOthers(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool {
 		return countWhere(t, pool, "status = 'delivered' AND event_id LIKE 'fast_%'") == 40
 	})
-	elapsed := time.Since(start)
-	t.Logf("healthy endpoint: 40 deliveries in %v; slow endpoint max concurrent requests: %d (cap %d, workers %d)",
-		elapsed.Round(time.Millisecond), maxInflight.Load(), limit, workers)
-	if elapsed > 2*time.Second {
-		t.Errorf("healthy endpoint took %v; the slow endpoint is starving it", elapsed)
+	res := isolationResult{healthyDone: time.Since(start)}
+	time.Sleep(1500 * time.Millisecond) // keep sampling the slow endpoint for a while
+	close(stopSampling)
+	<-samplerDone
+	res.senderPeak = int(senderPeak.Load())
+	res.receiverPeak = int(receiverPeak.Load())
+	res.slowAttempts = int(slowAttempts.Load())
+	t.Logf("healthy endpoint: 40 deliveries in %v; slow endpoint: sender peak %d, receiver peak %d, %d requests (cap %d, workers %d)",
+		res.healthyDone.Round(time.Millisecond), res.senderPeak, res.receiverPeak, res.slowAttempts, limit, workers)
+
+	if res.healthyDone > 500*time.Millisecond {
+		t.Errorf("healthy endpoint took %v; the slow endpoint is holding it back", res.healthyDone)
 	}
-	if maxInflight.Load() > limit {
-		t.Errorf("slow endpoint reached %d concurrent requests, cap is %d", maxInflight.Load(), limit)
+	if res.senderPeak > limit {
+		t.Errorf("sender had %d attempts in flight to the slow endpoint, cap is %d", res.senderPeak, limit)
 	}
+	if res.slowAttempts == 0 {
+		t.Error("slow endpoint was never attempted")
+	}
+	return res
+}
+
+// A slow endpoint (answers after 400ms, within the timeout) gets at most
+// the cap's worth of concurrent requests, and doesn't delay a healthy
+// endpoint. Because it answers, the receiver's view matches the sender's.
+func TestSlowEndpointDoesNotStallOthers(t *testing.T) {
+	res := runIsolation(t, func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(400 * time.Millisecond):
+		}
+	})
+	if res.receiverPeak > 2 {
+		t.Errorf("slow receiver saw %d concurrent requests, cap is 2", res.receiverPeak)
+	}
+}
+
+// An endpoint that never answers: every attempt times out. The sender
+// still never has more than the cap in flight and the healthy endpoint is
+// unaffected. The receiver may briefly see more than the cap, because an
+// abandoned request lingers on its side until it notices the disconnect;
+// that is logged, not asserted.
+func TestHangingEndpointDoesNotStallOthers(t *testing.T) {
+	runIsolation(t, func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(1500 * time.Millisecond):
+		}
+	})
 }
 
 // After BreakerThreshold consecutive failures the endpoint is paused: no
@@ -804,5 +875,43 @@ func TestMetricsAndReadiness(t *testing.T) {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("metrics missing %q", want)
 		}
+	}
+}
+
+// Regression test for the claiming bug fixed in migration 005: when the
+// endpoint with the oldest due work is already at its in-flight cap, a claim
+// must hand out another endpoint's delivery instead of coming back empty.
+func TestClaimSkipsEndpointsAtCap(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	st := store.New(pool, testBox)
+	full, err := st.CreateEndpoint(ctx, "https://example.com/full", []string{"a"}, "whsec_a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	free, err := st.CreateEndpoint(ctx, "https://example.com/free", []string{"b"}, "whsec_b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 4 {
+		st.CreateEvent(ctx, store.Event{ID: fmt.Sprintf("a_%d", i), Type: "a", Payload: json.RawMessage(`{}`)})
+	}
+	st.CreateEvent(ctx, store.Event{ID: "b_0", Type: "b", Payload: json.RawMessage(`{}`)})
+	// The full endpoint's work is the oldest...
+	if _, err := pool.Exec(ctx, `UPDATE deliveries SET next_attempt_at = now() - interval '1 hour' WHERE endpoint_id = $1`, full.ID); err != nil {
+		t.Fatal(err)
+	}
+	// ...and 2 of its deliveries are in flight, filling a cap of 2.
+	if _, err := pool.Exec(ctx, `UPDATE deliveries SET lease_expires_at = now() + interval '1 minute', next_attempt_at = now() + interval '1 minute'
+		WHERE id IN (SELECT id FROM deliveries WHERE endpoint_id = $1 ORDER BY id LIMIT 2)`, full.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	jobs, err := st.ClaimDue(ctx, 1, 10*time.Second, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].EndpointID != free.ID {
+		t.Fatalf("claim returned %d jobs (want 1 for the endpoint with free capacity)", len(jobs))
 	}
 }
