@@ -2,6 +2,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -12,28 +13,49 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/gnanreddy13/webhook-delivery/internal/netguard"
 	"github.com/gnanreddy13/webhook-delivery/internal/store"
 )
 
 const maxBodyBytes = 1 << 20 // 1 MiB
 
-type API struct {
-	store  *store.Store
-	apiKey string
+type Options struct {
+	APIKey string
+	// AllowPrivateDestinations skips the registration-time SSRF check
+	// (local development only; the workers enforce it separately).
+	AllowPrivateDestinations bool
 }
 
-// NewRouter builds the HTTP handler. Every route except /healthz requires
-// "Authorization: Bearer <apiKey>".
-func NewRouter(s *store.Store, apiKey string) http.Handler {
-	a := &API{store: s, apiKey: apiKey}
+type API struct {
+	store *store.Store
+	opts  Options
+}
+
+// NewRouter builds the HTTP handler. Every route except /healthz and
+// /readyz requires "Authorization: Bearer <APIKey>".
+func NewRouter(s *store.Store, opts Options) http.Handler {
+	a := &API{store: s, opts: opts}
 
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
+	// Liveness: the process is up.
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	// Readiness: the database is reachable.
+	r.Get("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := s.Ping(ctx); err != nil {
+			slog.Warn("readiness check failed", "err", err)
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "database unavailable"})
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
@@ -50,7 +72,7 @@ func NewRouter(s *store.Store, apiKey string) http.Handler {
 func (a *API) requireAPIKey(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if !ok || subtle.ConstantTimeCompare([]byte(token), []byte(a.apiKey)) != 1 {
+		if !ok || subtle.ConstantTimeCompare([]byte(token), []byte(a.opts.APIKey)) != 1 {
 			writeError(w, http.StatusUnauthorized, "missing or invalid API key")
 			return
 		}
@@ -72,6 +94,12 @@ func (a *API) createEndpoint(w http.ResponseWriter, r *http.Request) {
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		writeError(w, http.StatusBadRequest, "url must be an absolute http(s) URL")
 		return
+	}
+	if !a.opts.AllowPrivateDestinations {
+		if err := netguard.CheckURL(u); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	if len(req.EventTypes) == 0 {
 		writeError(w, http.StatusBadRequest, "event_types must not be empty")

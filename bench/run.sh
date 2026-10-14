@@ -6,7 +6,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-if [[ -f .env ]]; then set -a; . ./.env; set +a; else set -a; . ./.env.example; set +a; fi
+[[ -f .env ]] || { echo "no .env: run ./scripts/init-env.sh first" >&2; exit 1; }
+set -a; . ./.env; set +a
 
 WORKERS_LIST="${BENCH_WORKERS:-1 4 16 32}"
 FAIL_RATES="${BENCH_FAIL_RATES:-0 0.3}"
@@ -16,6 +17,8 @@ CONCURRENCY="${BENCH_CONCURRENCY:-32}"
 export BACKOFF_BASE="${BENCH_BACKOFF_BASE:-100ms}" BACKOFF_MAX="${BENCH_BACKOFF_MAX:-2s}"
 export MAX_ATTEMPTS="${BENCH_MAX_ATTEMPTS:-8}"
 export DB_MAX_CONNS="${BENCH_DB_MAX_CONNS:-40}"
+# The receiver runs on localhost, so SSRF protection must be off for the bench.
+export ALLOW_PRIVATE_DESTINATIONS=true
 LOG_DIR="$(mktemp -d)"
 
 go build -o bin/server ./cmd/server

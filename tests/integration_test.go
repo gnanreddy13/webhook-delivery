@@ -36,7 +36,10 @@ func testDB(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
 
-	adminURL := envOr("DATABASE_URL", "postgres://webhook:change-me-local-only@127.0.0.1:5432/webhook?sslmode=disable")
+	adminURL := databaseURL()
+	if adminURL == "" {
+		t.Skip("DATABASE_URL not set and no ../.env found (run ./scripts/init-env.sh)")
+	}
 	admin, err := db.Connect(ctx, adminURL, 0)
 	if err != nil {
 		t.Skipf("Postgres not reachable (start it with docker compose up -d): %v", err)
@@ -64,8 +67,19 @@ func testDB(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
+// newRouter returns the API with SSRF checks off, because the test receivers
+// are httptest servers on 127.0.0.1. TestSSRFProtection covers the checks.
+func newRouter(st *store.Store) http.Handler {
+	return api.NewRouter(st, api.Options{APIKey: apiKey, AllowPrivateDestinations: true})
+}
+
 // startWorkers runs a worker pool with fast retries until the test ends.
 func startWorkers(t *testing.T, st *store.Store, workers, maxAttempts int) {
+	t.Helper()
+	startWorkersWith(t, st, workers, maxAttempts, true)
+}
+
+func startWorkersWith(t *testing.T, st *store.Store, workers, maxAttempts int, allowPrivate bool) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	p := worker.New(worker.Config{
@@ -77,6 +91,8 @@ func startWorkers(t *testing.T, st *store.Store, workers, maxAttempts int) {
 		Timeout:      2 * time.Second,
 		Lease:        10 * time.Second,
 		PollInterval: 10 * time.Millisecond,
+
+		AllowPrivateDestinations: allowPrivate,
 	}, st)
 	done := make(chan struct{})
 	go func() { p.Run(ctx); close(done) }()
@@ -130,7 +146,7 @@ func registerEndpoint(t *testing.T, srv *httptest.Server, target string) (id, se
 
 func TestAuthRequired(t *testing.T) {
 	pool := testDB(t)
-	srv := httptest.NewServer(api.NewRouter(store.New(pool), apiKey))
+	srv := httptest.NewServer(newRouter(store.New(pool)))
 	defer srv.Close()
 
 	for _, path := range []string{"/deliveries", "/deliveries/1"} {
@@ -157,7 +173,7 @@ func TestAuthRequired(t *testing.T) {
 func TestFailingReceiverEndsDead(t *testing.T) {
 	pool := testDB(t)
 	st := store.New(pool)
-	srv := httptest.NewServer(api.NewRouter(st, apiKey))
+	srv := httptest.NewServer(newRouter(st))
 	defer srv.Close()
 
 	var hits atomic.Int32
@@ -208,7 +224,7 @@ func TestFailingReceiverEndsDead(t *testing.T) {
 func TestRetryThenDelivered(t *testing.T) {
 	pool := testDB(t)
 	st := store.New(pool)
-	srv := httptest.NewServer(api.NewRouter(st, apiKey))
+	srv := httptest.NewServer(newRouter(st))
 	defer srv.Close()
 
 	var hits atomic.Int32
@@ -236,7 +252,7 @@ func TestRetryThenDelivered(t *testing.T) {
 func TestDuplicateEventsAreIgnored(t *testing.T) {
 	pool := testDB(t)
 	st := store.New(pool)
-	srv := httptest.NewServer(api.NewRouter(st, apiKey))
+	srv := httptest.NewServer(newRouter(st))
 	defer srv.Close()
 
 	var mu sync.Mutex
@@ -307,7 +323,7 @@ func TestDuplicateEventsAreIgnored(t *testing.T) {
 func TestConcurrentWorkersDeliverEachRowOnce(t *testing.T) {
 	pool := testDB(t)
 	st := store.New(pool)
-	srv := httptest.NewServer(api.NewRouter(st, apiKey))
+	srv := httptest.NewServer(newRouter(st))
 	defer srv.Close()
 
 	var mu sync.Mutex
@@ -339,9 +355,54 @@ func TestConcurrentWorkersDeliverEachRowOnce(t *testing.T) {
 	}
 }
 
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
+// databaseURL returns $DATABASE_URL, falling back to the value in the
+// repository's .env so `go test ./...` works after ./scripts/init-env.sh.
+func databaseURL() string {
+	if v := os.Getenv("DATABASE_URL"); v != "" {
 		return v
 	}
-	return def
+	data, err := os.ReadFile("../.env")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(line), "DATABASE_URL="); ok {
+			return v
+		}
+	}
+	return ""
+}
+
+// With SSRF protection on, the API rejects internal URLs, and a worker
+// refuses to connect to an internal address even if such a row exists.
+func TestSSRFProtection(t *testing.T) {
+	pool := testDB(t)
+	st := store.New(pool)
+	srv := httptest.NewServer(api.NewRouter(st, api.Options{APIKey: apiKey}))
+	defer srv.Close()
+
+	for _, target := range []string{"http://127.0.0.1:9/x", "http://localhost/x", "http://169.254.169.254/latest/meta-data", "http://10.0.0.1/x"} {
+		code, out := apiCall(t, srv, "POST", "/endpoints", fmt.Sprintf(`{"url":%q,"event_types":["order.created"]}`, target))
+		if code != http.StatusBadRequest {
+			t.Errorf("registering %s: HTTP %d %v, want 400", target, code, out)
+		}
+	}
+
+	var hits atomic.Int32
+	receiver := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { hits.Add(1) }))
+	defer receiver.Close()
+	// Bypass the API check (e.g. a hostname that later resolves internally).
+	if _, err := st.CreateEndpoint(context.Background(), receiver.URL, []string{"order.created"}, "whsec_x"); err != nil {
+		t.Fatal(err)
+	}
+	startWorkersWith(t, st, 2, 2, false)
+	apiCall(t, srv, "POST", "/events", `{"id":"evt_ssrf","type":"order.created","payload":{}}`)
+	waitFor(t, 10*time.Second, func() bool { return countWhere(t, pool, "status = 'dead'") == 1 })
+
+	if n := countWhere(t, pool, "last_error LIKE '%is not allowed%'"); n != 1 {
+		t.Errorf("want dead delivery with a 'not allowed' error")
+	}
+	if hits.Load() != 0 {
+		t.Errorf("internal receiver was reached %d times", hits.Load())
+	}
 }

@@ -31,8 +31,8 @@ func run() error {
 		return err
 	}
 
-	if cfg.APIKey == "change-me" {
-		slog.Warn("API_KEY is the placeholder from .env.example; set a real one (openssl rand -hex 32)")
+	if cfg.AllowPrivateDestinations {
+		slog.Warn("ALLOW_PRIVATE_DESTINATIONS=true: SSRF protection is OFF; webhooks may target localhost and private networks")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -50,8 +50,12 @@ func run() error {
 	st := store.New(pool)
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           api.NewRouter(st, cfg.APIKey),
+		Handler:           api.NewRouter(st, api.Options{APIKey: cfg.APIKey, AllowPrivateDestinations: cfg.AllowPrivateDestinations}),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    64 << 10,
 	}
 
 	workers := worker.New(worker.Config{
@@ -63,6 +67,8 @@ func run() error {
 		Timeout:      cfg.DeliveryTimeout,
 		Lease:        cfg.LeaseDuration,
 		PollInterval: cfg.PollInterval,
+
+		AllowPrivateDestinations: cfg.AllowPrivateDestinations,
 	}, st)
 	workersDone := make(chan struct{})
 	go func() {
@@ -72,8 +78,15 @@ func run() error {
 
 	errc := make(chan error, 1)
 	go func() {
-		slog.Info("listening", "addr", cfg.ListenAddr, "workers", cfg.WorkerCount)
-		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+		tls := cfg.TLSCertFile != ""
+		slog.Info("listening", "addr", cfg.ListenAddr, "tls", tls, "workers", cfg.WorkerCount)
+		var err error
+		if tls {
+			err = srv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile)
+		} else {
+			err = srv.ListenAndServe()
+		}
+		if !errors.Is(err, http.ErrServerClosed) {
 			errc <- err
 		}
 	}()

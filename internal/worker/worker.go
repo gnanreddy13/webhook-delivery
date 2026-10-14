@@ -10,11 +10,13 @@ import (
 	"io"
 	"log/slog"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/gnanreddy13/webhook-delivery/internal/netguard"
 	"github.com/gnanreddy13/webhook-delivery/internal/signing"
 	"github.com/gnanreddy13/webhook-delivery/internal/store"
 )
@@ -28,6 +30,8 @@ type Config struct {
 	Timeout      time.Duration // per HTTP attempt
 	Lease        time.Duration
 	PollInterval time.Duration
+	// AllowPrivateDestinations disables the SSRF dial check (local dev only).
+	AllowPrivateDestinations bool
 }
 
 type Pool struct {
@@ -37,13 +41,23 @@ type Pool struct {
 }
 
 func New(cfg Config, s *store.Store) *Pool {
+	dialer := &net.Dialer{Timeout: cfg.Timeout, KeepAlive: 30 * time.Second}
+	if !cfg.AllowPrivateDestinations {
+		// Checked on the resolved IP of every connection, so DNS tricks
+		// can't reach internal services.
+		dialer.Control = netguard.Control
+	}
 	return &Pool{
 		cfg:   cfg,
 		store: s,
 		client: &http.Client{
 			Timeout: cfg.Timeout,
 			Transport: &http.Transport{
-				Proxy:               http.ProxyFromEnvironment,
+				// No proxy: an HTTP(S)_PROXY would make the dial check see
+				// the proxy's address instead of the webhook destination.
+				Proxy:               nil,
+				DialContext:         dialer.DialContext,
+				TLSHandshakeTimeout: cfg.Timeout,
 				MaxIdleConns:        100,
 				MaxIdleConnsPerHost: max(cfg.Workers, 2),
 				IdleConnTimeout:     90 * time.Second,

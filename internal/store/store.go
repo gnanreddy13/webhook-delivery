@@ -21,6 +21,10 @@ func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
 
+func (s *Store) Ping(ctx context.Context) error {
+	return s.pool.Ping(ctx)
+}
+
 type Endpoint struct {
 	ID         string    `json:"id"`
 	URL        string    `json:"url"`
