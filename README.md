@@ -17,7 +17,7 @@ Postgres is the only infrastructure. The queue is the `deliveries` table, and wo
 
 ## Quick start
 
-Requirements: Go 1.25+ (the `go.mod` minimum; tested only with Go 1.27.1), Docker (with Compose v2) and `curl`. From a fresh clone:
+Requirements: Go 1.25+ (tested with 1.25.14 and 1.27.1; see [Platforms tested](#platforms-tested)), Docker (with Compose v2) and `curl`. From a fresh clone:
 
 ```bash
 cp .env.example .env
@@ -111,7 +111,7 @@ worker goroutines (WORKER_COUNT) loop:
 
 - **One system, one transaction.** The outbox guarantee depends on the event and its delivery rows committing together. With Kafka you would need an outbox table plus a relay anyway, or a dual write that can lose or duplicate messages.
 - **Per-message state is the core of the problem.** Webhooks need per-delivery retry schedules, per-endpoint failure handling, dead letters, and queries like "show me the dead deliveries for endpoint X". In Postgres those are rows, indexes and `UPDATE`s. Kafka is an append-only log with per-partition offsets: delayed per-message retries need extra retry topics or a scheduler, and querying status means building a separate store.
-- **Enough throughput for this stage.** On a laptop this design delivered more than 4,000/s with 32 workers (see the benchmark below). That's far beyond what a single-tenant MVP needs.
+- **Enough throughput for this stage.** On a laptop this design delivered a median of about 4,500/s with 32 workers and an instant receiver, and about 2,350/s with 128 workers against a 50 ms receiver (see the benchmark below). That's far beyond what a single-tenant MVP needs.
 - **Operationally simpler.** One database to run, back up and inspect with SQL.
 
 Kafka (or similar) becomes worth it at much higher volume, or when many independent consumers need the same event stream. See the roadmap.
@@ -164,32 +164,45 @@ go test -race ./...
 ```bash
 ./bench/run.sh
 # or: BENCH_WORKERS="4 16" BENCH_FAIL_RATES="0.3" BENCH_EVENTS=10000 ./bench/run.sh
+# slow receiver: RECEIVER_DELAY=50ms BENCH_DB_MAX_CONNS=80 BENCH_WORKERS="16 32 64 128" BENCH_FAIL_RATES=0 ./bench/run.sh
 ```
 
 ## Benchmark results
 
-**Conditions:**
+**Conditions (all runs):**
 - Hardware: the author's MacBook (Apple M5 Pro, 15 cores, 24 GB, macOS 27).
-- Postgres 16 in Docker Desktop on the same machine, with default settings and a 40-connection pool.
-- Server, fake receiver and load generator all run on the same machine over localhost. The receiver does no work and does not verify signatures in the bench, though every request is still signed.
+- Postgres 16 in Docker Desktop on the same machine, with default settings. Pool size is 40 connections (`BENCH_DB_MAX_CONNS`), or 80 for the slow-receiver runs.
+- Server, fake receiver and load generator all run on the same machine over localhost. In the bench the receiver does not verify signatures, though every request is still signed.
 - 10,000 events per run, all of one type, sent by 32 concurrent HTTP clients, with 1 subscribed endpoint (so 10,000 deliveries).
 - Retry settings shortened for the bench: `BACKOFF_BASE=100ms`, `BACKOFF_MAX=2s`, `MAX_ATTEMPTS=8`.
-- Two full runs of the whole matrix. Both are shown because throughput at low worker counts varied noticeably between runs.
 
-These are loopback numbers with a receiver that responds instantly. Real receivers that take 50–500 ms per request lower per-worker throughput accordingly. Treat these figures as a ceiling for the queueing machinery, not a capacity plan.
+"Deliveries/s" is delivered rows divided by the time from the first event's `created_at` to the last `delivered_at`. Ingest (POST /events) overlaps with delivery.
 
-**Receiver always succeeds: delivery throughput by worker count**
+### 1. Instant receiver: the ceiling of the queue itself (5 runs)
 
-| Workers | Deliveries/s (run 1 / run 2) | POST /events p50 | POST /events p95 |
-|---|---|---|---|
-| 1 | 594 / 1,099 | 4.5 ms | 5.6 ms |
-| 4 | 1,740 / 2,516 | 4.5–4.7 ms | 5.8 ms |
-| 16 | 3,018 / 3,939 | 5.4–5.5 ms | 7.1–8.2 ms |
-| 32 | 4,395 / 4,263 | 6.6–6.7 ms | 8.3–8.4 ms |
+| Workers | Deliveries/s, median | Range across 5 runs | POST /events p50 | POST /events p95 |
+|---|---|---|---|---|
+| 1 | 1,099 | 594–1,284 | 4.4–4.5 ms | 5.4–5.6 ms |
+| 4 | 2,516 | 1,740–2,708 | 4.5–4.7 ms | 5.7–5.8 ms |
+| 16 | 3,983 | 3,018–4,041 | 5.4–5.6 ms | 6.9–8.2 ms |
+| 32 | 4,506 | 4,263–4,584 | 6.5–6.7 ms | 7.9–8.4 ms |
 
-"Deliveries/s" is delivered rows divided by the time from the first event's `created_at` to the last `delivered_at`. Ingest ran at about 4,700–7,000 events/s and overlapped with delivery. Ingest gets slower as more workers compete for Postgres, which is why POST latency rises with worker count.
+The low end of each range comes from run 1, the first 10k-event run on this database. I haven't investigated why it was slower (likely cold caches or table growth). Runs 2–5 were within about ±10% of each other. Ingest ran at about 4,700–7,000 events/s. Ingest slows as more workers compete for Postgres, which is why POST latency rises with worker count. These numbers are an upper limit for the queueing machinery, not a capacity plan.
 
-**Receiver fails 30% of requests at random (HTTP 500)**
+### 2. Receiver that takes 50 ms per request (`RECEIVER_DELAY=50ms`, 1 run each)
+
+| Workers | Deliveries/s | Ideal (workers ÷ 50 ms) | % of ideal | Time to drain 10k |
+|---|---|---|---|---|
+| 16 | 277 | 320 | 87% | 36.1 s |
+| 32 | 559 | 640 | 87% | 18.0 s |
+| 64 | 1,183 | 1,280 | 92% | 8.5 s |
+| 128 | 2,352 | 2,560 | 92% | 4.3 s |
+
+With a slow receiver, each worker spends nearly all its time waiting on HTTP, so throughput scales linearly with workers. Database round trips cost the remaining 8–13%. Size `WORKER_COUNT` roughly as target rate × receiver latency. Workers hold a DB connection only while claiming or recording, so 128 workers ran fine on 80 connections. POST /events p95 stayed at 5.7–6.8 ms.
+
+With the same 50 ms receiver failing 30% of requests: 16/32/64/128 workers drained in 55.3/29.3/18.2/11.6 s. Success was 100% except for 1 dead delivery in the 128-worker run, with 1.42–1.44 average attempts.
+
+### 3. Instant receiver failing 30% of requests at random (HTTP 500, 2 runs)
 
 | Workers | Success rate (run 1 / run 2) | Avg attempts per delivery | Dead | Time to drain |
 |---|---|---|---|---|
@@ -198,7 +211,12 @@ These are loopback numbers with a receiver that responds instantly. Real receive
 | 16 | 100% / 100% | 1.415 / 1.432 | 0 / 0 | 6.1 s / 9.3 s |
 | 32 | 100% / 99.99% | 1.426 / 1.435 | 0 / 1 | 8.4 s / 8.7 s |
 
-Across 80,000 deliveries at a 30% failure rate, 2 ended dead. That matches expectations: the chance of failing 8 times in a row is 0.3⁸ ≈ 0.0066%, or about 5 expected across 80,000. The average attempts match the theoretical 1/0.7 ≈ 1.43. POST /events latency was the same as in the success-only runs (p50 4.5–6.5 ms, p95 5.6–8.0 ms). With failures, drain time comes mostly from the retry backoff schedule (up to about 8 s of cumulative backoff for an unlucky delivery), not from worker capacity. That is why 16 and 32 workers land within run-to-run noise of each other.
+Across the 120,000 deliveries run at a 30% failure rate (tables 2 and 3), 3 ended dead. That's in line with expectations: the chance of failing 8 times in a row is 0.3⁸ ≈ 0.0066%, or about 8 expected. Average attempts match the theoretical 1/0.7 ≈ 1.43. With failures, drain time comes mostly from the retry backoff schedule (up to about 8 s of cumulative backoff for an unlucky delivery), not from worker capacity. That is why 16 and 32 workers land within run-to-run noise of each other here.
+
+### Platforms tested
+
+- macOS 27 (Apple Silicon), Go 1.27.1: demo, tests (`-race`), all benchmarks above.
+- Linux (Debian 13, arm64, in a `golang:1.25` container on Docker Desktop), Go 1.25.14: `go vet`, all tests with `-race`, and a short bench run (server, workers and receiver end to end). Native x86-64 Linux has not been tested. `scripts/demo.sh` was not run there because it needs the Docker CLI.
 
 ## Limitations
 

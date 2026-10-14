@@ -15,7 +15,7 @@ CONCURRENCY="${BENCH_CONCURRENCY:-32}"
 # Short backoff so a 30%-failure run drains in seconds rather than minutes.
 export BACKOFF_BASE="${BENCH_BACKOFF_BASE:-100ms}" BACKOFF_MAX="${BENCH_BACKOFF_MAX:-2s}"
 export MAX_ATTEMPTS="${BENCH_MAX_ATTEMPTS:-8}"
-export DB_MAX_CONNS="${DB_MAX_CONNS:-40}"
+export DB_MAX_CONNS="${BENCH_DB_MAX_CONNS:-40}"
 LOG_DIR="$(mktemp -d)"
 
 go build -o bin/server ./cmd/server
