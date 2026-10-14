@@ -6,6 +6,16 @@ a webhook delivery service i built in go & postgresql. register an endpoint, sen
 
 postgres is the only infrastructure. the queue is just the `deliveries` table, and workers claim rows with `FOR UPDATE SKIP LOCKED`.
 
+```mermaid
+flowchart LR
+    client([your app]) -- "POST /events" --> api[api server]
+    api -- "one transaction:<br/>event + deliveries" --> db[(postgres)]
+    db -- "claim with<br/>SKIP LOCKED + lease" --> workers[workers]
+    workers -- "signed POST" --> receivers([receiver endpoints])
+    workers -- "2xx → delivered<br/>else → retry with backoff,<br/>dead after N tries" --> db
+    workers -. "per-endpoint cap<br/>& circuit breaker" .-> receivers
+```
+
 > ## security notice...
 >
 > this is a **single-tenant** service: one shared api key, one organization's endpoints. it's built to run as a service other systems call, as long as:
@@ -64,22 +74,6 @@ every route except the health checks needs `Authorization: Bearer $API_KEY`. you
 
 ## how it works...
 
-```
-POST /events ──► one transaction:
-                   INSERT event (ON CONFLICT (id) DO NOTHING)
-                   INSERT one deliveries row per subscribed, enabled endpoint
-                 ──► 202
-
-worker goroutines (WORKER_COUNT), in any number of processes, loop:
-  claim:   claim_deliveries(): lock eligible endpoints, then lease the oldest due
-           row of each, up to ENDPOINT_MAX_INFLIGHT leased rows per endpoint
-  send:    signed POST, SSRF-checked dial, DELIVERY_TIMEOUT
-  record:  2xx → delivered, endpoint breaker reset
-           otherwise → attempts+1 and retry after backoff (dead at MAX_ATTEMPTS);
-                       endpoint failure count +1, paused if it reaches BREAKER_THRESHOLD
-retention (hourly): delete finished deliveries, then orphaned events, older than RETENTION_PERIOD
-```
-
 - **transactional outbox.** an event and its deliveries are written in one transaction, so a 202 means every delivery row exists.
 - **idempotent ingest.** sending the same event id twice is a no-op (`ON CONFLICT DO NOTHING`), even under concurrency.
 - **leases, not long-held locks.** workers claim rows with `SKIP LOCKED` and a short lease. a crashed worker's rows come back when the lease expires, and the lease doubles as a fencing token.
@@ -88,7 +82,7 @@ retention (hourly): delete finished deliveries, then orphaned events, older than
 - **secrets at rest.** endpoint signing secrets are encrypted with AES-256-GCM.
 - **at-least-once & unordered.** receivers should dedupe on `Webhook-Id`.
 
-the full version, incl. why the cap needed a two-statement sql function: [docs/design.md](docs/design.md).
+the full version, incl. the step-by-step flow and why the cap needed a two-statement sql function: [docs/design.md](docs/design.md).
 
 ## why postgres & not kafka...
 
