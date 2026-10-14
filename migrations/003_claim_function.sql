@@ -2,7 +2,10 @@
 -- per-endpoint cap on in-flight (leased) deliveries exactly.
 --
 -- Two statements on purpose: the first locks eligible endpoint rows
--- (SKIP LOCKED, so concurrent claimers spread across endpoints); the second
+-- (SKIP LOCKED, so concurrent claimers spread across endpoints). It uses
+-- FOR NO KEY UPDATE, which serializes claimers but does not conflict with the
+-- KEY SHARE locks taken by foreign-key checks when events insert deliveries,
+-- so ingest and claiming don't block or skip each other. The second
 -- runs with a fresh snapshot taken after those locks were granted (READ
 -- COMMITTED gives each statement in a volatile function a new snapshot), so
 -- it counts every lease committed by earlier claimers of the same endpoint.
@@ -36,7 +39,7 @@ BEGIN
         ORDER BY (SELECT min(d.next_attempt_at) FROM deliveries d
                   WHERE d.endpoint_id = ep.id AND d.status = 'pending')
         LIMIT p_limit
-        FOR UPDATE OF ep SKIP LOCKED
+        FOR NO KEY UPDATE OF ep SKIP LOCKED
     ) s;
 
     IF ep_ids IS NULL THEN

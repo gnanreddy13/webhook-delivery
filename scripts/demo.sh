@@ -56,7 +56,8 @@ for _ in $(seq 50); do curl -sf "$API/healthz" >/dev/null && break; sleep 0.2; d
 curl -sf "$API/healthz" >/dev/null || { cat "$LOG_DIR/server.log"; exit 1; }
 
 echo "==> resetting demo tables"
-psql -c "TRUNCATE deliveries, events, endpoints"
+# Lock endpoints first, like the workers' claim query, to avoid a deadlock.
+psql -c "BEGIN; LOCK TABLE endpoints, deliveries, events IN ACCESS EXCLUSIVE MODE; TRUNCATE deliveries, events, endpoints; COMMIT;"
 
 echo "==> registering endpoints"
 register() {

@@ -52,7 +52,12 @@ func main() {
 		log.Fatal(err)
 	}
 	defer pool.Close()
-	must(pool.Exec(ctx, "TRUNCATE deliveries, events, endpoints"))
+	// Lock in the same order claim_deliveries does (endpoints first) so a
+	// running server's workers wait instead of deadlocking with the TRUNCATE.
+	must(pool.Exec(ctx, `BEGIN;
+		LOCK TABLE endpoints, deliveries, events IN ACCESS EXCLUSIVE MODE;
+		TRUNCATE deliveries, events, endpoints;
+		COMMIT`))
 
 	client := &http.Client{
 		Timeout:   10 * time.Second,
