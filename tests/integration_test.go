@@ -24,12 +24,15 @@ import (
 
 	"github.com/gnanreddy13/webhook-delivery/internal/api"
 	"github.com/gnanreddy13/webhook-delivery/internal/db"
+	"github.com/gnanreddy13/webhook-delivery/internal/secretbox"
 	"github.com/gnanreddy13/webhook-delivery/internal/signing"
 	"github.com/gnanreddy13/webhook-delivery/internal/store"
 	"github.com/gnanreddy13/webhook-delivery/internal/worker"
 )
 
 const apiKey = "test-api-key"
+
+var testBox, _ = secretbox.New(strings.Repeat("ab", 32), "")
 
 // testDB returns a pool on a freshly migrated and emptied test database.
 func testDB(t *testing.T) *pgxpool.Pool {
@@ -146,7 +149,7 @@ func registerEndpoint(t *testing.T, srv *httptest.Server, target string) (id, se
 
 func TestAuthRequired(t *testing.T) {
 	pool := testDB(t)
-	srv := httptest.NewServer(newRouter(store.New(pool)))
+	srv := httptest.NewServer(newRouter(store.New(pool, testBox)))
 	defer srv.Close()
 
 	for _, path := range []string{"/deliveries", "/deliveries/1"} {
@@ -172,7 +175,7 @@ func TestAuthRequired(t *testing.T) {
 // signed attempts, with the last status code recorded.
 func TestFailingReceiverEndsDead(t *testing.T) {
 	pool := testDB(t)
-	st := store.New(pool)
+	st := store.New(pool, testBox)
 	srv := httptest.NewServer(newRouter(st))
 	defer srv.Close()
 
@@ -223,7 +226,7 @@ func TestFailingReceiverEndsDead(t *testing.T) {
 // A receiver that fails twice and then succeeds ends "delivered" on attempt 3.
 func TestRetryThenDelivered(t *testing.T) {
 	pool := testDB(t)
-	st := store.New(pool)
+	st := store.New(pool, testBox)
 	srv := httptest.NewServer(newRouter(st))
 	defer srv.Close()
 
@@ -251,7 +254,7 @@ func TestRetryThenDelivered(t *testing.T) {
 // create one delivery per endpoint, and deliver each exactly once.
 func TestDuplicateEventsAreIgnored(t *testing.T) {
 	pool := testDB(t)
-	st := store.New(pool)
+	st := store.New(pool, testBox)
 	srv := httptest.NewServer(newRouter(st))
 	defer srv.Close()
 
@@ -322,7 +325,7 @@ func TestDuplicateEventsAreIgnored(t *testing.T) {
 // exactly one worker.
 func TestConcurrentWorkersDeliverEachRowOnce(t *testing.T) {
 	pool := testDB(t)
-	st := store.New(pool)
+	st := store.New(pool, testBox)
 	srv := httptest.NewServer(newRouter(st))
 	defer srv.Close()
 
@@ -377,7 +380,7 @@ func databaseURL() string {
 // refuses to connect to an internal address even if such a row exists.
 func TestSSRFProtection(t *testing.T) {
 	pool := testDB(t)
-	st := store.New(pool)
+	st := store.New(pool, testBox)
 	srv := httptest.NewServer(api.NewRouter(st, api.Options{APIKey: apiKey}))
 	defer srv.Close()
 
@@ -405,4 +408,57 @@ func TestSSRFProtection(t *testing.T) {
 	if hits.Load() != 0 {
 		t.Errorf("internal receiver was reached %d times", hits.Load())
 	}
+}
+
+// Secrets are stored encrypted, legacy plaintext rows get encrypted at
+// startup, and a key rotation re-seals old rows with the new key.
+func TestSecretsEncryptedAtRest(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	st := store.New(pool, testBox)
+	ep, err := st.CreateEndpoint(ctx, "https://example.com/a", []string{"x"}, "whsec_new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A row as it would have been written before encryption existed.
+	if _, err := pool.Exec(ctx, `INSERT INTO endpoints (url, event_types, secret) VALUES ('https://example.com/b', '{x}', 'whsec_legacy')`); err != nil {
+		t.Fatal(err)
+	}
+	stored := func() []string {
+		rows, _ := pool.Query(ctx, `SELECT secret FROM endpoints ORDER BY url`)
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var s string
+			rows.Scan(&s)
+			out = append(out, s)
+		}
+		return out
+	}
+	if s := stored(); strings.Contains(s[0], "whsec_new") || !secretbox.IsSealed(s[0]) {
+		t.Fatalf("new secret stored unencrypted: %q", s[0])
+	}
+
+	if n, err := st.ReencryptSecrets(ctx); err != nil || n != 1 {
+		t.Fatalf("legacy migration: n=%d err=%v, want 1 row", n, err)
+	}
+	for _, s := range stored() {
+		if !secretbox.IsSealed(s) || strings.Contains(s, "whsec_") {
+			t.Fatalf("secret still plaintext after migration: %q", s)
+		}
+	}
+
+	// Rotate keys: new current key, old key as previous.
+	rotated, _ := secretbox.New(strings.Repeat("cd", 32), strings.Repeat("ab", 32))
+	st2 := store.New(pool, rotated)
+	if n, err := st2.ReencryptSecrets(ctx); err != nil || n != 2 {
+		t.Fatalf("rotation: n=%d err=%v, want 2 rows", n, err)
+	}
+	newOnly, _ := secretbox.New(strings.Repeat("cd", 32), "")
+	for _, s := range stored() {
+		if _, _, err := newOnly.Open(s); err != nil {
+			t.Fatalf("after rotation a secret still needs the old key: %v", err)
+		}
+	}
+	_ = ep
 }

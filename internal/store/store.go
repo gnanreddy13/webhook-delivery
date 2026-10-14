@@ -5,20 +5,24 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/gnanreddy13/webhook-delivery/internal/secretbox"
 )
 
 var ErrNotFound = errors.New("not found")
 
 type Store struct {
 	pool *pgxpool.Pool
+	box  *secretbox.Box // encrypts endpoint secrets at rest
 }
 
-func New(pool *pgxpool.Pool) *Store {
-	return &Store{pool: pool}
+func New(pool *pgxpool.Pool, box *secretbox.Box) *Store {
+	return &Store{pool: pool, box: box}
 }
 
 func (s *Store) Ping(ctx context.Context) error {
@@ -53,14 +57,66 @@ type Delivery struct {
 	DeliveredAt    *time.Time `json:"delivered_at"`
 }
 
+// CreateEndpoint stores the endpoint with its secret encrypted. The returned
+// Endpoint carries the plaintext secret so it can be shown once.
 func (s *Store) CreateEndpoint(ctx context.Context, url string, eventTypes []string, secret string) (Endpoint, error) {
 	e := Endpoint{URL: url, EventTypes: eventTypes, Secret: secret}
-	err := s.pool.QueryRow(ctx,
+	sealed, err := s.box.Seal(secret)
+	if err != nil {
+		return e, err
+	}
+	err = s.pool.QueryRow(ctx,
 		`INSERT INTO endpoints (url, event_types, secret) VALUES ($1, $2, $3)
 		 RETURNING id, created_at`,
-		url, eventTypes, secret,
+		url, eventTypes, sealed,
 	).Scan(&e.ID, &e.CreatedAt)
 	return e, err
+}
+
+// ReencryptSecrets encrypts any plaintext secrets (rows written before
+// encryption existed) and re-seals secrets that only the previous key can
+// open, so SECRET_ENCRYPTION_KEY_PREVIOUS can be dropped afterwards.
+func (s *Store) ReencryptSecrets(ctx context.Context) (updated int, err error) {
+	rows, err := s.pool.Query(ctx, `SELECT id, secret FROM endpoints`)
+	if err != nil {
+		return 0, err
+	}
+	type row struct{ id, secret string }
+	var all []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.secret); err != nil {
+			return 0, err
+		}
+		all = append(all, r)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	for _, r := range all {
+		plain := r.secret
+		if secretbox.IsSealed(r.secret) {
+			p, usedPrevious, err := s.box.Open(r.secret)
+			if err != nil {
+				return updated, fmt.Errorf("endpoint %s: %w", r.id, err)
+			}
+			if !usedPrevious {
+				continue
+			}
+			plain = p
+		}
+		sealed, err := s.box.Seal(plain)
+		if err != nil {
+			return updated, err
+		}
+		if _, err := s.pool.Exec(ctx, `UPDATE endpoints SET secret = $2 WHERE id = $1 AND secret = $3`,
+			r.id, sealed, r.secret); err != nil {
+			return updated, err
+		}
+		updated++
+	}
+	return updated, nil
 }
 
 // CreateEvent stores the event and fans it out to one pending delivery per
@@ -154,7 +210,8 @@ type Job struct {
 	Payload        json.RawMessage
 	EventCreatedAt time.Time
 	URL            string
-	Secret         string
+	Secret         string // decrypted
+	SecretErr      error  // set if the stored secret could not be decrypted
 }
 
 // ClaimDue locks up to limit due pending deliveries with FOR UPDATE SKIP
@@ -188,6 +245,7 @@ func (s *Store) ClaimDue(ctx context.Context, limit int, lease time.Duration) ([
 			&j.Payload, &j.EventCreatedAt, &j.URL, &j.Secret); err != nil {
 			return nil, err
 		}
+		j.Secret, _, j.SecretErr = s.box.Open(j.Secret)
 		jobs = append(jobs, j)
 	}
 	return jobs, rows.Err()

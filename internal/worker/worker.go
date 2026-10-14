@@ -148,6 +148,10 @@ func (p *Pool) process(log *slog.Logger, j store.Job) {
 // send makes one signed POST. It returns the HTTP status code (0 if no
 // response) and a non-nil error unless the response was 2xx.
 func (p *Pool) send(j store.Job) (int, error) {
+	if j.SecretErr != nil {
+		// Never send unsigned; record it as a failed attempt instead.
+		return 0, fmt.Errorf("signing secret unavailable: %w", j.SecretErr)
+	}
 	body, err := json.Marshal(map[string]any{
 		"id":         j.EventID,
 		"type":       j.EventType,

@@ -28,6 +28,11 @@ type Config struct {
 	// sent to localhost/private networks. Local development only.
 	AllowPrivateDestinations bool
 
+	// Endpoint secrets are encrypted at rest with this key (64 hex chars).
+	// During a rotation, the old key goes in SecretEncryptionKeyPrevious.
+	SecretEncryptionKey         string
+	SecretEncryptionKeyPrevious string
+
 	WorkerCount     int
 	MaxAttempts     int
 	BackoffBase     time.Duration
@@ -46,6 +51,9 @@ func Load() (Config, error) {
 		APIKey:      os.Getenv("API_KEY"),
 		TLSCertFile: os.Getenv("TLS_CERT_FILE"),
 		TLSKeyFile:  os.Getenv("TLS_KEY_FILE"),
+
+		SecretEncryptionKey:         os.Getenv("SECRET_ENCRYPTION_KEY"),
+		SecretEncryptionKeyPrevious: os.Getenv("SECRET_ENCRYPTION_KEY_PREVIOUS"),
 	}
 	var err error
 	if c.AllowInsecureHTTP, err = boolEnv("ALLOW_INSECURE_HTTP"); err != nil {
@@ -87,6 +95,8 @@ func Load() (Config, error) {
 		return c, errors.New("DATABASE_URL must be set")
 	case c.APIKey == "":
 		return c, errors.New("API_KEY must be set (run ./scripts/init-env.sh to generate one)")
+	case c.SecretEncryptionKey == "":
+		return c, errors.New("SECRET_ENCRYPTION_KEY must be set (run ./scripts/init-env.sh to generate one)")
 	case len(c.APIKey) < 32:
 		return c, errors.New("API_KEY must be at least 32 characters (e.g. openssl rand -hex 32)")
 	case (c.TLSCertFile == "") != (c.TLSKeyFile == ""):

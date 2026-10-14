@@ -14,6 +14,7 @@ func TestLoadValidation(t *testing.T) {
 	}{
 		{"missing database url", map[string]string{"DATABASE_URL": ""}, "DATABASE_URL"},
 		{"missing key", map[string]string{"API_KEY": ""}, "API_KEY must be set"},
+		{"missing encryption key", map[string]string{"SECRET_ENCRYPTION_KEY": ""}, "SECRET_ENCRYPTION_KEY"},
 		{"short key", map[string]string{"API_KEY": "change-me"}, "at least 32"},
 		{"public http refused", map[string]string{"LISTEN_ADDR": "0.0.0.0:8080"}, "refusing plain HTTP"},
 		{"public http behind proxy", map[string]string{"LISTEN_ADDR": "0.0.0.0:8080", "ALLOW_INSECURE_HTTP": "true"}, ""},
@@ -27,6 +28,7 @@ func TestLoadValidation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("DATABASE_URL", "postgres://localhost/x")
 			t.Setenv("API_KEY", strongKey)
+			t.Setenv("SECRET_ENCRYPTION_KEY", strings.Repeat("ab", 32))
 			t.Setenv("LISTEN_ADDR", "")
 			t.Setenv("TLS_CERT_FILE", "")
 			t.Setenv("TLS_KEY_FILE", "")

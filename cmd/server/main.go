@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"github.com/gnanreddy13/webhook-delivery/internal/api"
 	"github.com/gnanreddy13/webhook-delivery/internal/config"
 	"github.com/gnanreddy13/webhook-delivery/internal/db"
+	"github.com/gnanreddy13/webhook-delivery/internal/secretbox"
 	"github.com/gnanreddy13/webhook-delivery/internal/store"
 	"github.com/gnanreddy13/webhook-delivery/internal/worker"
 )
@@ -47,7 +49,16 @@ func run() error {
 		return err
 	}
 
-	st := store.New(pool)
+	box, err := secretbox.New(cfg.SecretEncryptionKey, cfg.SecretEncryptionKeyPrevious)
+	if err != nil {
+		return err
+	}
+	st := store.New(pool, box)
+	if n, err := st.ReencryptSecrets(ctx); err != nil {
+		return fmt.Errorf("re-encrypting endpoint secrets: %w", err)
+	} else if n > 0 {
+		slog.Info("re-encrypted endpoint secrets with the current key", "count", n)
+	}
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           api.NewRouter(st, api.Options{APIKey: cfg.APIKey, AllowPrivateDestinations: cfg.AllowPrivateDestinations}),
