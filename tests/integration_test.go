@@ -43,11 +43,11 @@ func testDB(t *testing.T) *pgxpool.Pool {
 
 	adminURL := databaseURL()
 	if adminURL == "" {
-		t.Skip("DATABASE_URL not set and no ../.env found (run ./scripts/init-env.sh)")
+		skipOrFail(t, "DATABASE_URL not set and no ../.env found (run ./scripts/init-env.sh)")
 	}
 	admin, err := db.Connect(ctx, adminURL, 0)
 	if err != nil {
-		t.Skipf("Postgres not reachable (start it with docker compose up -d): %v", err)
+		skipOrFail(t, fmt.Sprintf("Postgres not reachable (start it with docker compose up -d): %v", err))
 	}
 	_, err = admin.Exec(ctx, "CREATE DATABASE webhook_test")
 	admin.Close()
@@ -370,6 +370,16 @@ func TestConcurrentWorkersDeliverEachRowOnce(t *testing.T) {
 			t.Errorf("delivery %s sent %d times", id, n)
 		}
 	}
+}
+
+// skipOrFail skips locally but fails in CI, so a broken database setup
+// there can't make the integration tests silently pass.
+func skipOrFail(t *testing.T, msg string) {
+	t.Helper()
+	if os.Getenv("CI") != "" {
+		t.Fatal(msg)
+	}
+	t.Skip(msg)
 }
 
 // databaseURL returns $DATABASE_URL, falling back to the value in the

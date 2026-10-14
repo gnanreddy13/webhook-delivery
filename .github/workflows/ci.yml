@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (Go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.25", "stable"] # go.mod minimum and latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: webhook
+          POSTGRES_PASSWORD: ci-throwaway-password # CI-only database, discarded after the job
+          POSTGRES_DB: webhook
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U webhook -d webhook"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+    env:
+      DATABASE_URL: postgres://webhook:ci-throwaway-password@localhost:5432/webhook?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - name: gofmt
+        run: test -z "$(gofmt -l . | tee /dev/stderr)"
+      - name: go vet
+        run: go vet ./...
+      # Integration tests fail instead of skipping when CI is set.
+      - name: go test -race
+        run: go test -race -count=1 ./...
+
+  quickstart:
+    name: README quick start + container build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Quick start (the three README commands)
+        run: |
+          ./scripts/init-env.sh
+          docker compose up -d --wait
+          ./scripts/demo.sh
+      - name: Build the container image
+        run: docker build -t webhook-delivery:ci .
+      - name: Server logs on failure
+        if: failure()
+        run: docker compose logs
